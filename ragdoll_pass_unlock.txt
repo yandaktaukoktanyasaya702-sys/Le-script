@@ -1,0 +1,329 @@
+-- Ragdoll Engine gamepass unlock — client-side attribute spoof.
+-- The game's own client scripts read LocalPlayer:GetAttribute("Pass<id>").
+-- Writes here are local-only and never replicate to the server.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+local ORDER = { "supervip", "vip", "all", "events", "guns", "explosives", "projectiles", "energy", "sandbox" }
+
+local NAMES = {
+	supervip = "Super VIP",
+	vip = "VIP",
+	all = "All Pass",
+	events = "Unlimited Events",
+	guns = "Guns",
+	explosives = "Explosives",
+	projectiles = "Projectiles",
+	energy = "Energy",
+	sandbox = "Sandbox",
+}
+
+-- Fallback: MAIN edition IDs (GameId 10767907509)
+local passIds = {
+	guns = 1999124522,
+	explosives = 1998170520,
+	projectiles = 1999508518,
+	energy = 1999976520,
+	sandbox = 1997834553,
+	all = 1999329625,
+	vip = 1999430564,
+	events = 2026796985,
+	supervip = 2025525030,
+}
+
+pcall(function()
+	local engine = ReplicatedStorage:WaitForChild("RagdollEngine", 8)
+	local mod = engine and engine:WaitForChild("Passes", 8)
+	if mod then
+		local ok, result = pcall(require, mod)
+		if ok and type(result) == "table" and type(result.guns) == "number" then
+			passIds = result
+		end
+	end
+end)
+
+local function passKey(id)
+	return "Pass" .. id
+end
+
+local function owned(id)
+	return LocalPlayer:GetAttribute(passKey(id)) == true
+end
+
+local function setOwned(id, state)
+	LocalPlayer:SetAttribute(passKey(id), state)
+end
+
+local parent = type(gethui) == "function" and gethui() or CoreGui
+local old = parent:FindFirstChild("RE_PassUnlock") or CoreGui:FindFirstChild("RE_PassUnlock")
+if old then
+	old:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "RE_PassUnlock"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = parent
+
+local function corner(radius, obj)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = obj
+	return c
+end
+
+local frame = Instance.new("Frame")
+frame.AnchorPoint = Vector2.new(0.5, 0.5)
+frame.Position = UDim2.new(0.5, -360, 0.5, 0)
+frame.Size = UDim2.fromOffset(272, 44)
+frame.AutomaticSize = Enum.AutomaticSize.Y
+frame.BackgroundColor3 = Color3.fromRGB(22, 24, 28)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = gui
+corner(14, frame)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(60, 66, 76)
+stroke.Thickness = 1
+stroke.Parent = frame
+
+local layout = Instance.new("UIListLayout")
+layout.FillDirection = Enum.FillDirection.Vertical
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 4)
+layout.Parent = frame
+
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 12)
+pad.PaddingBottom = UDim.new(0, 12)
+pad.PaddingLeft = UDim.new(0, 12)
+pad.PaddingRight = UDim.new(0, 12)
+pad.Parent = frame
+
+local titleRow = Instance.new("Frame")
+titleRow.BackgroundTransparency = 1
+titleRow.Size = UDim2.new(1, 0, 0, 22)
+titleRow.LayoutOrder = 0
+titleRow.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextColor3 = Color3.fromRGB(235, 238, 242)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "PASSES · Ragdoll Engine"
+title.Size = UDim2.new(1, -90, 1, 0)
+title.Parent = titleRow
+
+local sub = Instance.new("TextLabel")
+sub.BackgroundTransparency = 1
+sub.Font = Enum.Font.Gotham
+sub.TextSize = 11
+sub.TextColor3 = Color3.fromRGB(130, 136, 146)
+sub.TextXAlignment = Enum.TextXAlignment.Right
+sub.Text = "drag me"
+sub.Size = UDim2.fromOffset(84, 22)
+sub.Position = UDim2.new(1, -84, 0, 0)
+sub.Parent = titleRow
+
+local actions = Instance.new("Frame")
+actions.BackgroundTransparency = 1
+actions.Size = UDim2.new(1, 0, 0, 28)
+actions.LayoutOrder = 1
+actions.Parent = frame
+
+local unlockAll = Instance.new("TextButton")
+unlockAll.Size = UDim2.new(0.5, -3, 1, 0)
+unlockAll.BackgroundColor3 = Color3.fromRGB(38, 70, 48)
+unlockAll.AutoButtonColor = false
+unlockAll.Font = Enum.Font.GothamBold
+unlockAll.TextSize = 12
+unlockAll.TextColor3 = Color3.fromRGB(210, 240, 216)
+unlockAll.Text = "UNLOCK ALL"
+unlockAll.Parent = actions
+corner(8, unlockAll)
+
+local lockAll = Instance.new("TextButton")
+lockAll.Size = UDim2.new(0.5, -3, 1, 0)
+lockAll.Position = UDim2.new(0.5, 3, 0, 0)
+lockAll.BackgroundColor3 = Color3.fromRGB(64, 36, 40)
+lockAll.AutoButtonColor = false
+lockAll.Font = Enum.Font.GothamBold
+lockAll.TextSize = 12
+lockAll.TextColor3 = Color3.fromRGB(240, 210, 214)
+lockAll.Text = "LOCK ALL"
+lockAll.Parent = actions
+corner(8, lockAll)
+
+local hold = true
+
+local holdBtn = Instance.new("TextButton")
+holdBtn.Size = UDim2.new(1, 0, 0, 26)
+holdBtn.BackgroundColor3 = Color3.fromRGB(32, 46, 38)
+holdBtn.AutoButtonColor = false
+holdBtn.Font = Enum.Font.GothamMedium
+holdBtn.TextSize = 12
+holdBtn.TextColor3 = Color3.fromRGB(190, 230, 200)
+holdBtn.Text = ""
+holdBtn.LayoutOrder = 2
+holdBtn.Parent = frame
+corner(8, holdBtn)
+
+local rows = {}
+
+local footer = Instance.new("TextLabel")
+footer.BackgroundTransparency = 1
+footer.Font = Enum.Font.Gotham
+footer.TextSize = 11
+footer.TextColor3 = Color3.fromRGB(120, 126, 136)
+footer.TextXAlignment = Enum.TextXAlignment.Center
+footer.Text = ""
+footer.Size = UDim2.new(1, 0, 0, 18)
+footer.LayoutOrder = 100
+footer.Parent = frame
+
+local function refresh()
+	local count = 0
+	for _, passName in ipairs(ORDER) do
+		local on = owned(passIds[passName])
+		if on then
+			count += 1
+		end
+		local row = rows[passName]
+		if row then
+			row.state.Text = on and "SPOOFED" or "off"
+			row.state.TextColor3 = on and Color3.fromRGB(120, 220, 140) or Color3.fromRGB(120, 126, 136)
+			row.button.BackgroundColor3 = on and Color3.fromRGB(34, 50, 40) or Color3.fromRGB(32, 36, 42)
+		end
+	end
+	footer.Text = ("spoofed %d/%d · local only, server untouched"):format(count, #ORDER)
+end
+
+local function updateHold()
+	if hold then
+		holdBtn.Text = "hold: ON — re-asserts if the game overwrites"
+		holdBtn.BackgroundColor3 = Color3.fromRGB(32, 46, 38)
+		holdBtn.TextColor3 = Color3.fromRGB(190, 230, 200)
+	else
+		holdBtn.Text = "hold: OFF — one-shot unlock"
+		holdBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 44)
+		holdBtn.TextColor3 = Color3.fromRGB(170, 174, 182)
+	end
+end
+
+for index, passName in ipairs(ORDER) do
+	local id = passIds[passName]
+	local row = Instance.new("TextButton")
+	row.Size = UDim2.new(1, 0, 0, 26)
+	row.BackgroundColor3 = Color3.fromRGB(32, 36, 42)
+	row.AutoButtonColor = false
+	row.Text = ""
+	row.LayoutOrder = 10 + index
+	row.Parent = frame
+	corner(8, row)
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 13
+	label.TextColor3 = Color3.fromRGB(220, 224, 230)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Text = ("%s  ·  %d"):format(NAMES[passName] or passName, id)
+	label.Size = UDim2.new(1, -96, 1, 0)
+	label.Position = UDim2.fromOffset(10, 0)
+	label.Parent = row
+
+	local state = Instance.new("TextLabel")
+	state.BackgroundTransparency = 1
+	state.Font = Enum.Font.GothamBold
+	state.TextSize = 11
+	state.TextColor3 = Color3.fromRGB(120, 126, 136)
+	state.TextXAlignment = Enum.TextXAlignment.Right
+	state.Text = "off"
+	state.Size = UDim2.fromOffset(86, 26)
+	state.Position = UDim2.new(1, -92, 0, 0)
+	state.Parent = row
+
+	row.Activated:Connect(function()
+		setOwned(id, not owned(id))
+		refresh()
+	end)
+
+	rows[passName] = { button = row, state = state }
+
+	LocalPlayer:GetAttributeChangedSignal(passKey(id)):Connect(function()
+		if hold and LocalPlayer:GetAttribute(passKey(id)) ~= true then
+			setOwned(id, true)
+		end
+		refresh()
+	end)
+end
+
+unlockAll.Activated:Connect(function()
+	for _, passName in ipairs(ORDER) do
+		setOwned(passIds[passName], true)
+	end
+	refresh()
+end)
+
+lockAll.Activated:Connect(function()
+	hold = false
+	updateHold()
+	for _, passName in ipairs(ORDER) do
+		setOwned(passIds[passName], false)
+	end
+	refresh()
+end)
+
+holdBtn.Activated:Connect(function()
+	hold = not hold
+	updateHold()
+	if hold then
+		for _, passName in ipairs(ORDER) do
+			if not owned(passIds[passName]) then
+				setOwned(passIds[passName], true)
+			end
+		end
+	end
+	refresh()
+end)
+
+do
+	local dragging, dragStart, startPos
+	titleRow.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+updateHold()
+
+for _, passName in ipairs(ORDER) do
+	setOwned(passIds[passName], true)
+end
+
+refresh()
+
+return "RE_PassUnlock loaded — all passes spoofed client-side"

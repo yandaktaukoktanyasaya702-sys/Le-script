@@ -1,0 +1,538 @@
+-- RSE2 // ORACLE v3
+-- Deterministic PriceEngine + client seed = exact future prices.
+-- One position at a time. Hold to peak. No churn.
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+
+local Shared = RS:WaitForChild("Shared")
+local PE = require(Shared:WaitForChild("PriceEngine"))
+local MC = require(Shared:WaitForChild("MarketClock"))
+local CFG = require(Shared:WaitForChild("Config"))
+local State = require(LP.PlayerScripts:WaitForChild("Client"):WaitForChild("State"))
+
+local Remotes = RS:WaitForChild("Remotes")
+local Trade = Remotes:WaitForChild("Trade")
+local Boot = Remotes:WaitForChild("GetBootstrap")
+local Redeem = Remotes:WaitForChild("RedeemCode")
+local ClaimReward = Remotes:WaitForChild("ClaimReward")
+local ClaimDaily = Remotes:WaitForChild("ClaimDaily")
+local ClaimDesk = Remotes:WaitForChild("ClaimDesk")
+local ClaimCareer = Remotes:WaitForChild("ClaimCareer")
+local ClaimCloseReport = Remotes:WaitForChild("ClaimCloseReport")
+local FreeSkip = Remotes:WaitForChild("FreeSkip")
+
+local CONFIG = {
+	HORIZON = 28800,
+	COARSE = 24,
+	FINE = 720,
+	MIN_EDGE = 0.03,
+	MIN_NET = 0.04,
+	MARGIN_RISK = 0.97,
+	LIQ_SAFETY = 4,
+	LEV_CAP = 5,
+	POLL = 1.0,
+	COOLDOWN = 15,
+	LEAD = 0.15,
+}
+
+local CODES = { "THANKS15K", "STOCKMARKET", "TOOLS", "MEMECOINS", "FUTURES", "RELEASE", "UPDATE", "BULLMARKET" }
+local CLASSES = { stock = true, crypto = true, etf = true }
+
+_G.RSE2_GEN = (_G.RSE2_GEN or 0) + 1
+local GEN = _G.RSE2_GEN
+LP:SetAttribute("RSE2_GEN", GEN)
+local function alive()
+	return _G.RSE2_GEN == GEN and LP:GetAttribute("RSE2_GEN") == GEN
+end
+
+for _, g in ipairs(LP:WaitForChild("PlayerGui"):GetChildren()) do
+	if g.Name == "RSE2Oracle" then g:Destroy() end
+end
+
+local profile, seed
+local running = true
+local holding
+local cooldown = 0
+local backoff = 0
+local sessionEquity
+local lastRefresh = 0
+local logLines = {}
+
+local function log(msg)
+	table.insert(logLines, 1, os.date("%H:%M:%S") .. "  " .. tostring(msg))
+	while #logLines > 8 do table.remove(logLines) end
+end
+
+local function invoke(remote, ...)
+	if not remote then return nil end
+	local ok, res = pcall(remote.InvokeServer, remote, ...)
+	if ok and type(res) == "table" then return res end
+	return nil
+end
+
+local function refresh()
+	local b = invoke(Boot)
+	if b and b.profile then
+		profile = b.profile
+		seed = profile.seed
+	end
+	return profile
+end
+
+local function maxLev(level)
+	level = tonumber(level) or 1
+	if level >= 120 then return 100 end
+	if level >= 60 then return 75 end
+	if level >= 50 then return 50 end
+	if level >= 20 then return 20 end
+	if level >= 10 then return 10 end
+	if level >= 5 then return 5 end
+	return 1
+end
+
+local function eligible(a)
+	if not a or not a.id then return false end
+	if not CLASSES[a.class] then return false end
+	if a.meme or a.isMemeCoin or a.isPlayerStock or a.composition or a.track or a.ratio then return false end
+	if not State.assetIsProcedural(a) then return false end
+	if State.assetIsDelisted(a) then return false end
+	if (tonumber(a.vol) or 0) > 2.05 then return false end
+	return true
+end
+
+local function analyse(a, fromT, horizon, steps)
+	local p0 = PE.priceAt(seed, a, fromT)
+	if not p0 or p0 <= 0 then return nil end
+	local peak, peakT, low = p0, fromT, p0
+	local minBeforePeak, lowNow = p0, p0
+	for i = 1, steps do
+		local t = fromT + horizon * i / steps
+		local p = PE.priceAt(seed, a, t)
+		if p then
+			if p < lowNow then lowNow = p end
+			if p > peak then
+				peak, peakT = p, t
+				minBeforePeak = lowNow
+			end
+			if p < low then low = p end
+		end
+	end
+	return {
+		entry = p0,
+		peak = peak,
+		peakT = peakT,
+		gain = (peak - p0) / p0,
+		minBeforePeak = minBeforePeak,
+		ddBeforePeak = (p0 - minBeforePeak) / p0,
+		minAhead = low,
+	}
+end
+
+local function equityOf(p)
+	local now = State.now()
+	local eq = tonumber(p.cash) or 0
+	for _, v in ipairs(p.positions or {}) do
+		local a = State.resolveAsset(v.id)
+		local cur = a and PE.priceAt(seed, a, now) or v.avg
+		eq = eq + (tonumber(v.initialMargin) or 0) + (cur - v.avg) * v.qty
+	end
+	return eq
+end
+
+local function impactAt(a, qty, price)
+	local ok, v = pcall(PE.executionImpactFor, a, qty, price, 1)
+	if ok and type(v) == "number" then return v end
+	return 0
+end
+
+local function capacity(a, price)
+	local floatUnits = (a.shares or a.supply or 0) * 1e6
+	return floatUnits * price * 0.0003
+end
+
+local function scan()
+	local now = State.now()
+	local equity = equityOf(profile)
+	local levMax = maxLev(profile.level)
+	local cash = tonumber(profile.cash) or 0
+	local coarse = {}
+	for _, a in ipairs(State.listedAssets()) do
+		if eligible(a) then
+			local p0 = PE.priceAt(seed, a, now)
+			if p0 and p0 > 0 then
+				local hi = p0
+				for i = 1, CONFIG.COARSE do
+					local p = PE.priceAt(seed, a, now + CONFIG.HORIZON * i / CONFIG.COARSE)
+					if p and p > hi then hi = p end
+				end
+				local g = (hi - p0) / p0
+				if g > CONFIG.MIN_EDGE then table.insert(coarse, { a = a, gain = g }) end
+			end
+		end
+	end
+	table.sort(coarse, function(x, y) return x.gain > y.gain end)
+
+	local best
+	for i = 1, math.min(8, #coarse) do
+		local c = coarse[i]
+		local r = analyse(c.a, now, CONFIG.HORIZON, CONFIG.FINE)
+		if r and r.gain > CONFIG.MIN_EDGE then
+			local levByPath = math.floor(0.9 / (CONFIG.LIQ_SAFETY * math.max(r.ddBeforePeak, 0.008)))
+			local lev = math.max(1, math.min(levMax, CONFIG.LEV_CAP, levByPath))
+			local cap = capacity(c.a, r.entry)
+			local margin = math.min(cash * CONFIG.MARGIN_RISK, equity * CONFIG.MARGIN_RISK)
+			if cap > 0 then margin = math.min(margin, cap * 0.95 / lev) end
+			local notional = margin * lev
+			if notional >= 50 then
+				local qty = notional / r.entry
+				local imp = impactAt(c.a, qty, r.entry)
+				local net = r.gain - 2 * imp
+				local holdReal = (r.peakT - now) / CFG.TIME_SCALE
+				if net > CONFIG.MIN_NET and holdReal >= 10 then
+					local score = net * lev
+					if not best or score > best.score then
+						best = { a = c.a, plan = r, lev = lev, qty = qty, imp = imp, net = net, score = score, margin = margin }
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function openPosition(pick)
+	if not alive() then return false end
+	if #(profile.positions or {}) > 0 then return false end
+	local plan, a = pick.plan, pick.a
+	local qty = pick.qty
+	if qty <= 0 then return false end
+	if (tonumber(profile.cash) or 0) < (pick.margin or 0) * 1.02 then
+		log("skip: cash short")
+		return false
+	end
+	local res = invoke(Trade, { action = "open", id = a.id, qty = qty, direction = 1, lev = pick.lev })
+	if not res then log("open: no reply"); return false end
+	if not res.ok then
+		local e = tostring(res.err)
+		log("reject: " .. e)
+		local low = e:lower()
+		if low:find("slow down") then
+			backoff = os.clock() + 60
+		else
+			cooldown = os.clock() + 8
+		end
+		return false
+	end
+	profile = res
+	local fresh
+	for _, v in ipairs(res.positions or {}) do
+		if v.id == a.id and (not fresh or (tonumber(v.openedAt) or 0) >= (tonumber(fresh.openedAt) or 0)) then
+			fresh = v
+		end
+	end
+	local peakT = plan.peakT
+	local lead = math.max(1800, (peakT - State.now()) * CONFIG.LEAD)
+	holding = {
+		id = a.id,
+		entry = fresh and fresh.avg or plan.entry,
+		qty = fresh and fresh.qty or qty,
+		lev = fresh and tonumber(fresh.lev) or pick.lev,
+		exitT = peakT - lead,
+		peakT = peakT,
+		peak = plan.peak,
+		net = pick.net,
+	}
+	log(string.format("OPEN %s %dx net+%.1f%% hold %ds",
+		a.id, holding.lev, pick.net * 100, math.floor((peakT - lead - State.now()) / CFG.TIME_SCALE)))
+	return true
+end
+
+local function closePosition(reason)
+	if not alive() then return false end
+	local res = invoke(Trade, { action = "closeAll" })
+	if res and res.ok then
+		profile = res
+		log("CLOSE " .. tostring(reason) .. " +$" .. string.format("%.0f", tonumber(res.sellProfit) or 0))
+		holding = nil
+		cooldown = os.clock() + CONFIG.COOLDOWN
+		return true
+	end
+	local e = tostring(res and res.err)
+	local low = e:lower()
+	if low:find("slow down") then
+		backoff = os.clock() + 60
+		log("close fail: slow down")
+	elseif low:find("no open positions") then
+		holding = nil
+		refresh()
+		log("closed externally")
+	else
+		log("close fail: " .. e)
+	end
+	return false
+end
+
+local function redeemAll()
+	for _, code in ipairs(CODES) do invoke(Redeem, code) end
+	refresh()
+end
+
+local function claimAll()
+	local function t(r, ...) invoke(r, ...) end
+	for _, k in ipairs({ "group", "favorite", "like" }) do t(ClaimReward, k) end
+	t(ClaimDaily); t(ClaimDesk); t(ClaimCareer); t(ClaimCloseReport); t(FreeSkip)
+	refresh()
+end
+
+-- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "RSE2Oracle"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 2147483647
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = LP:WaitForChild("PlayerGui")
+
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromOffset(316, 340)
+panel.Position = UDim2.new(0, 18, 0, 120)
+panel.BackgroundColor3 = Color3.fromRGB(14, 17, 21)
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Parent = gui
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(46, 160, 96)
+stroke.Thickness = 1
+stroke.Transparency = 0.35
+stroke.Parent = panel
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 6)
+corner.Parent = panel
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -12, 0, 28)
+title.Position = UDim2.fromOffset(12, 4)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextColor3 = Color3.fromRGB(90, 220, 140)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "RSE2 // ORACLE"
+title.Parent = panel
+
+local stats = Instance.new("TextLabel")
+stats.Position = UDim2.fromOffset(12, 32)
+stats.Size = UDim2.new(1, -24, 0, 48)
+stats.BackgroundTransparency = 1
+stats.Font = Enum.Font.Code
+stats.TextSize = 12
+stats.TextColor3 = Color3.fromRGB(215, 222, 230)
+stats.TextXAlignment = Enum.TextXAlignment.Left
+stats.TextYAlignment = Enum.TextYAlignment.Top
+stats.Text = "booting..."
+stats.Parent = panel
+
+local status = Instance.new("TextLabel")
+status.Position = UDim2.fromOffset(12, 82)
+status.Size = UDim2.new(1, -24, 0, 18)
+status.BackgroundTransparency = 1
+status.Font = Enum.Font.Code
+status.TextSize = 11
+status.TextColor3 = Color3.fromRGB(240, 190, 90)
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Text = "idle"
+status.Parent = panel
+
+local logBox = Instance.new("Frame")
+logBox.Position = UDim2.fromOffset(12, 106)
+logBox.Size = UDim2.new(1, -24, 0, 158)
+logBox.BackgroundColor3 = Color3.fromRGB(8, 10, 13)
+logBox.BorderSizePixel = 0
+logBox.Parent = panel
+local lc = Instance.new("UICorner")
+lc.CornerRadius = UDim.new(0, 4)
+lc.Parent = logBox
+
+local logLabel = Instance.new("TextLabel")
+logLabel.Position = UDim2.fromOffset(6, 4)
+logLabel.Size = UDim2.new(1, -12, 1, -8)
+logLabel.BackgroundTransparency = 1
+logLabel.Font = Enum.Font.Code
+logLabel.TextSize = 10
+logLabel.TextColor3 = Color3.fromRGB(150, 200, 170)
+logLabel.TextXAlignment = Enum.TextXAlignment.Left
+logLabel.TextYAlignment = Enum.TextYAlignment.Top
+logLabel.Text = ""
+logLabel.Parent = logBox
+
+local toggle = Instance.new("TextButton")
+toggle.Position = UDim2.new(0, 12, 1, -54)
+toggle.Size = UDim2.fromOffset(138, 38)
+toggle.BackgroundColor3 = Color3.fromRGB(30, 120, 70)
+toggle.BorderSizePixel = 0
+toggle.Font = Enum.Font.GothamBold
+toggle.TextSize = 12
+toggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggle.Text = "PAUSE"
+toggle.Parent = panel
+local tc = Instance.new("UICorner")
+tc.CornerRadius = UDim.new(0, 4)
+tc.Parent = toggle
+
+local claimBtn = Instance.new("TextButton")
+claimBtn.Position = UDim2.new(1, -150, 1, -54)
+claimBtn.Size = UDim2.fromOffset(138, 38)
+claimBtn.BackgroundColor3 = Color3.fromRGB(45, 50, 60)
+claimBtn.BorderSizePixel = 0
+claimBtn.Font = Enum.Font.GothamBold
+claimBtn.TextSize = 12
+claimBtn.TextColor3 = Color3.fromRGB(230, 235, 240)
+claimBtn.Text = "CLAIM ALL"
+claimBtn.Parent = panel
+local cc = Instance.new("UICorner")
+cc.CornerRadius = UDim.new(0, 4)
+cc.Parent = claimBtn
+
+toggle.MouseButton1Click:Connect(function()
+	running = not running
+	toggle.Text = running and "PAUSE" or "RUN"
+	toggle.BackgroundColor3 = running and Color3.fromRGB(30, 120, 70) or Color3.fromRGB(120, 70, 30)
+	log(running and "resumed" or "paused")
+end)
+
+claimBtn.MouseButton1Click:Connect(function()
+	task.spawn(function() claimAll(); redeemAll() end)
+end)
+
+local dragStart, startPos
+panel.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragStart = input.Position
+		startPos = panel.Position
+	end
+end)
+UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragStart = nil
+	end
+end)
+UIS.InputChanged:Connect(function(input)
+	if dragStart and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+		local d = input.Position - dragStart
+		panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end)
+
+local function fmt(n)
+	n = tonumber(n) or 0
+	local neg = n < 0
+	n = math.abs(n)
+	local s
+	if n >= 1e9 then s = string.format("%.2fB", n / 1e9)
+	elseif n >= 1e6 then s = string.format("%.2fM", n / 1e6)
+	elseif n >= 1e3 then s = string.format("%.1fK", n / 1e3)
+	else s = string.format("%.0f", n) end
+	return (neg and "-" or "") .. s
+end
+
+task.spawn(function()
+	pcall(function()
+		refresh()
+		sessionEquity = equityOf(profile)
+		log("online seed " .. tostring(seed))
+	end)
+	task.wait(0.5)
+	task.spawn(function() pcall(redeemAll) end)
+	task.wait(0.5)
+	task.spawn(function() pcall(claimAll) end)
+	while alive() do
+		task.wait(300)
+		if running and alive() then
+			task.spawn(function() pcall(function() claimAll(); redeemAll() end) end)
+		end
+	end
+end)
+
+task.spawn(function()
+	while alive() do
+		task.wait(CONFIG.POLL)
+		if not alive() then break end
+		local ok, err = pcall(function()
+			if not profile or os.clock() - lastRefresh > 10 then
+				refresh()
+				lastRefresh = os.clock()
+			end
+			if not profile or not seed then status.Text = "no profile"; return end
+
+			local positions = profile.positions or {}
+			if holding and #positions == 0 then
+				holding = nil
+				cooldown = os.clock() + 5
+			end
+			if not holding and #positions > 0 then
+				local v = positions[1]
+				local a = State.resolveAsset(v.id)
+				if a then
+					local now2 = State.now()
+					local plan = analyse(a, now2, CONFIG.HORIZON, CONFIG.FINE)
+					holding = {
+						id = v.id, entry = v.avg, qty = v.qty, lev = v.lev,
+						exitT = (plan and plan.peakT - math.max(1800, (plan.peakT - now2) * CONFIG.LEAD)) or (now2 + 3600),
+						peakT = plan and plan.peakT or (now2 + 3600),
+						peak = plan and plan.peak, net = plan and plan.gain or 0,
+					}
+					log("adopted " .. v.id)
+				end
+			end
+
+			local now = State.now()
+			if holding then
+				local a = State.resolveAsset(holding.id)
+				local cur = a and PE.priceAt(seed, a, now) or holding.entry
+				local pnl = (cur - holding.entry) / holding.entry * holding.lev * 100
+				local liq = holding.entry * (1 - 0.9 / holding.lev)
+				local safety = (cur - liq) / cur
+
+				local exitNow, why = false, "peak"
+				if cur <= liq * 1.03 then
+					exitNow, why = true, "safety"
+				elseif holding.peak and cur >= holding.peak * 0.995 then
+					exitNow, why = true, "peak"
+				elseif holding.peakT and now >= holding.peakT - 0.5 * CFG.TIME_SCALE then
+					exitNow, why = true, "peak"
+				end
+
+				if exitNow then
+					closePosition(why)
+				else
+					local toPeak = holding.peakT and math.max(0, (holding.peakT - now) / CFG.TIME_SCALE) or 0
+					local left = holding.peak and math.max(0, (holding.peak - cur) / cur * 100) or 0
+					status.Text = string.format("%s %dx %+.1f%% peak +%.1f%% in %ds liq %+.0f%%",
+						holding.id, holding.lev, pnl, left, math.floor(toPeak), safety * 100)
+				end
+			elseif running and os.clock() >= cooldown and os.clock() >= backoff then
+				status.Text = "scanning"
+				local pick = scan()
+				if pick then openPosition(pick) else status.Text = "no edge" end
+			else
+				status.Text = "waiting"
+			end
+
+			local eq = equityOf(profile)
+			local delta = eq - (sessionEquity or eq)
+			stats.Text = string.format("equity $%s   %s$%s\nlvl %d  xp %d  cash $%s",
+				fmt(eq), delta >= 0 and "+" or "-", fmt(math.abs(delta)),
+				tonumber(profile.level) or 1, tonumber(profile.xp) or 0, fmt(profile.cash))
+			logLabel.Text = table.concat(logLines, "\n")
+		end)
+		if not ok then log("ERR " .. tostring(err)) end
+	end
+end)
+
+log("loaded")
+return "oracle v3"
