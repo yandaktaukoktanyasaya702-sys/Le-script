@@ -1,0 +1,2592 @@
+-- RoFront [World PvP] MP OP // SABLE
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+
+local RATIO_NEUTRAL = 0.14
+local RATIO_BOAT = 0.4
+local BOAT_INTERVAL = 9
+local SCAN_BUDGET = 9000
+local RESERVE_MIN = 6000
+
+local PHASE = {
+	early = { neutral = 0.12, neutralMin = 0.1, neutralMax = 0.18, enemyNeed = 1.25, enemyMin = 0.45, enemyMax = 0.75, keep = 0.12, defenseCap = 1, raidReserve = 1.15 },
+	mid = { neutral = 0.16, neutralMin = 0.12, neutralMax = 0.22, enemyNeed = 1.5, enemyMin = 0.4, enemyMax = 0.78, keep = 0.2, defenseCap = 3, raidReserve = 1.25 },
+	late = { neutral = 0.2, neutralMin = 0.15, neutralMax = 0.28, enemyNeed = 1.35, enemyMin = 0.5, enemyMax = 0.85, keep = 0.15, defenseCap = 4, raidReserve = 1.2 },
+}
+
+local Rules = require(RS:WaitForChild("Airfront"):WaitForChild("Core"):WaitForChild("Rules"))
+
+local function fmt(n)
+	n = tonumber(n) or 0
+	if n >= 1e9 then
+		return string.format("%.2fB", n / 1e9)
+	elseif n >= 1e6 then
+		return string.format("%.2fM", n / 1e6)
+	elseif n >= 1e3 then
+		return string.format("%.1fk", n / 1e3)
+	end
+	return tostring(math.floor(n))
+end
+
+local session, st, me
+
+local function findSession()
+	if type(session) == "table" then
+		local s = rawget(session, "state")
+		if type(s) == "table" and type(rawget(s, "local_owner")) == "number" then
+			return session
+		end
+	end
+	local cached = _G.RF_SESSION
+	if type(cached) == "table" then
+		local s = rawget(cached, "state")
+		if type(s) == "table" and type(rawget(s, "local_owner")) == "number" then
+			session = cached
+			return session
+		end
+	end
+	if type(getgc) == "function" then
+		for _, v in ipairs(getgc(true)) do
+			if type(v) == "table" then
+				local s = rawget(v, "state")
+				if type(s) == "table" and type(rawget(s, "local_owner")) == "number" and rawget(v, "mode") ~= nil and rawget(v, "env") ~= nil then
+					session = v
+					_G.RF_SESSION = v
+					return session
+				end
+			end
+		end
+	end
+end
+
+local function live()
+	local s = findSession()
+	if not s then
+		return nil
+	end
+	local state = rawget(s, "state")
+	if type(state) ~= "table" or not state.loaded then
+		return nil
+	end
+	local owner = tonumber(rawget(state, "local_owner")) or 0
+	if owner <= 0 then
+		return nil
+	end
+	session, st, me = s, state, owner
+	return state, owner, s
+end
+
+local frontier = {}
+local nextFrontier = {}
+local frontierSet = {}
+local nextFrontierSet = {}
+local coast = {}
+local nextCoast = {}
+local owned = {}
+local nextOwned = {}
+local neutralFront, enemyFront, allyFront = 0, 0, 0
+local scanN, scanE, scanA = 0, 0, 0
+local scanCursor = 0
+local attackCursor = 0
+local boatCursor = 0
+local boatBlocked = {}
+local lastBoat = 0
+local lastMsg = ""
+local brain = { mode = "HOLD", note = "boot", reserve = 0, target = 0, lastAttack = 0, lastBuild = 0, lastBoat = 0, threatUntil = 0 }
+
+local function tileOwner(s, t)
+	return buffer.readi32(s.owner, t * 4)
+end
+
+local function isLand(s, t)
+	return buffer.readu8(s.map.land, t) ~= 0
+end
+
+local function scanStep(budget)
+	local s, owner = live()
+	if not s then
+		return
+	end
+	local map = s.map
+	if type(map.land_list) ~= "buffer" then
+		return
+	end
+	local W, N = s.W, s.N
+	local count = map.land_count
+	local coastalBuf = map.coastal
+	local j = scanCursor
+	local done = 0
+	while j < count and done < budget do
+		local t = buffer.readi32(map.land_list, j * 4)
+		if tileOwner(s, t) == owner then
+			nextOwned[#nextOwned + 1] = t
+			if type(coastalBuf) == "buffer" and buffer.readu8(coastalBuf, t) == 1 then
+				nextCoast[#nextCoast + 1] = t
+			end
+			local x = t % W
+			local border = false
+			if x > 0 then
+				local n = t - 1
+				if isLand(s, n) and tileOwner(s, n) ~= owner then
+					border = true
+				end
+			end
+			if not border and x < W - 1 then
+				local n = t + 1
+				if isLand(s, n) and tileOwner(s, n) ~= owner then
+					border = true
+				end
+			end
+			if not border and t >= W then
+				local n = t - W
+				if isLand(s, n) and tileOwner(s, n) ~= owner then
+					border = true
+				end
+			end
+			if not border and t < N - W then
+				local n = t + W
+				if isLand(s, n) and tileOwner(s, n) ~= owner then
+					border = true
+				end
+			end
+			if border then
+				nextFrontier[#nextFrontier + 1] = t
+				nextFrontierSet[t] = true
+				local hasN, hasE, hasA = false, false, false
+				if x > 0 then
+					local n = t - 1
+					if isLand(s, n) then
+						local o = tileOwner(s, n)
+						if o == 0 then
+							hasN = true
+						elseif o ~= owner then
+							if s:are_allies(owner, o) then
+								hasA = true
+							else
+								hasE = true
+							end
+						end
+					end
+				end
+				if x < W - 1 then
+					local n = t + 1
+					if isLand(s, n) then
+						local o = tileOwner(s, n)
+						if o == 0 then
+							hasN = true
+						elseif o ~= owner then
+							if s:are_allies(owner, o) then
+								hasA = true
+							else
+								hasE = true
+							end
+						end
+					end
+				end
+				if t >= W then
+					local n = t - W
+					if isLand(s, n) then
+						local o = tileOwner(s, n)
+						if o == 0 then
+							hasN = true
+						elseif o ~= owner then
+							if s:are_allies(owner, o) then
+								hasA = true
+							else
+								hasE = true
+							end
+						end
+					end
+				end
+				if t < N - W then
+					local n = t + W
+					if isLand(s, n) then
+						local o = tileOwner(s, n)
+						if o == 0 then
+							hasN = true
+						elseif o ~= owner then
+							if s:are_allies(owner, o) then
+								hasA = true
+							else
+								hasE = true
+							end
+						end
+					end
+				end
+				if hasN then
+					scanN = scanN + 1
+				end
+				if hasE then
+					scanE = scanE + 1
+				end
+				if hasA then
+					scanA = scanA + 1
+				end
+			end
+		end
+		j = j + 1
+		done = done + 1
+	end
+	scanCursor = j
+	if j >= count then
+		frontier = nextFrontier
+		nextFrontier = {}
+		frontierSet = nextFrontierSet
+		nextFrontierSet = {}
+		coast = nextCoast
+		nextCoast = {}
+		owned = nextOwned
+		nextOwned = {}
+		neutralFront, enemyFront, allyFront = scanN, scanE, scanA
+		scanN, scanE, scanA = 0, 0, 0
+		scanCursor = 0
+	end
+end
+
+local function targetsOf(s, t, owner)
+	local W, N = s.W, s.N
+	local x = t % W
+	local neutral, enemy
+	if x > 0 then
+		local n = t - 1
+		if isLand(s, n) then
+			local o = tileOwner(s, n)
+			if o ~= owner then
+				if o == 0 then
+					neutral = neutral or n
+				elseif not s:are_allies(owner, o) then
+					enemy = enemy or n
+				end
+			end
+		end
+	end
+	if x < W - 1 then
+		local n = t + 1
+		if isLand(s, n) then
+			local o = tileOwner(s, n)
+			if o ~= owner then
+				if o == 0 then
+					neutral = neutral or n
+				elseif not s:are_allies(owner, o) then
+					enemy = enemy or n
+				end
+			end
+		end
+	end
+	if t >= W then
+		local n = t - W
+		if isLand(s, n) then
+			local o = tileOwner(s, n)
+			if o ~= owner then
+				if o == 0 then
+					neutral = neutral or n
+				elseif not s:are_allies(owner, o) then
+					enemy = enemy or n
+				end
+			end
+		end
+	end
+	if t < N - W then
+		local n = t + W
+		if isLand(s, n) then
+			local o = tileOwner(s, n)
+			if o ~= owner then
+				if o == 0 then
+					neutral = neutral or n
+				elseif not s:are_allies(owner, o) then
+					enemy = enemy or n
+				end
+			end
+		end
+	end
+	return neutral, enemy
+end
+
+local function incomingCount(s, owner)
+	local n = 0
+	for _, a in pairs(s.attacks) do
+		if a.target == owner and a.attacker ~= 0 then
+			n = n + 1
+		end
+	end
+	return n
+end
+
+local function reserveFor(info)
+	local byIncome = math.floor((info.income or 0) * 3)
+	local byCap = math.floor((info.max_troops or 0) * 0.08)
+	return math.max(RESERVE_MIN, byIncome, byCap)
+end
+
+local function nearbyTargets(s, t, owner)
+	local W, N = s.W, s.N
+	local x = t % W
+	local out = {}
+	local function add(n)
+		if n >= 0 and n < N and isLand(s, n) then
+			local o = tileOwner(s, n)
+			if o ~= owner and not s:are_allies(owner, o) then
+				out[#out + 1] = { tile = n, owner = o }
+			end
+		end
+	end
+	if x > 0 then
+		add(t - 1)
+	end
+	if x < W - 1 then
+		add(t + 1)
+	end
+	if t >= W then
+		add(t - W)
+	end
+	if t < N - W then
+		add(t + W)
+	end
+	return out
+end
+
+local function clusterScore(s, tile, owner)
+	local o = tileOwner(s, tile)
+	local score = 0
+	local W, N = s.W, s.N
+	local x = tile % W
+	local function same(n)
+		if n >= 0 and n < N and isLand(s, n) and tileOwner(s, n) == o then
+			score = score + 1
+		end
+	end
+	if x > 0 then
+		same(tile - 1)
+	end
+	if x < W - 1 then
+		same(tile + 1)
+	end
+	if tile >= W then
+		same(tile - W)
+	end
+	if tile < N - W then
+		same(tile + W)
+	end
+	return score
+end
+
+local function pickNeutral(s, owner)
+	local best, bestScore
+	local tries = math.min(#frontier, 64)
+	for _ = 1, tries do
+		attackCursor = (attackCursor % #frontier) + 1
+		local t = frontier[attackCursor]
+		if t and tileOwner(s, t) == owner then
+			for _, target in ipairs(nearbyTargets(s, t, owner)) do
+				if target.owner == 0 then
+					local score = clusterScore(s, target.tile, owner)
+					if not bestScore or score > bestScore then
+						best, bestScore = target.tile, score
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function pickEnemy(s, owner, myTroops, force)
+	local best, bestOwner, bestTroops, bestScore
+	local tries = math.min(#frontier, 64)
+	for _ = 1, tries do
+		attackCursor = (attackCursor % #frontier) + 1
+		local t = frontier[attackCursor]
+		if t and tileOwner(s, t) == owner then
+			for _, target in ipairs(nearbyTargets(s, t, owner)) do
+				if target.owner ~= 0 then
+					local ei = s:get_owner(target.owner)
+					if ei and ei.alive and (force or myTroops > ei.troops * 1.15 + 3000) then
+						local score = clusterScore(s, target.tile, owner) * 500 - ei.troops
+						if not bestScore or score > bestScore then
+							best, bestOwner, bestTroops, bestScore = target.tile, target.owner, ei.troops, score
+						end
+					end
+				end
+			end
+		end
+	end
+	return best, bestOwner, bestTroops
+end
+
+local function attackNeutral(force)
+	local s, owner, sess = live()
+	if not s then
+		return false, "not in match"
+	end
+	local info = s:get_owner(owner)
+	if not info then
+		return false, "no owner"
+	end
+	local reserve = reserveFor(info)
+	if info.troops < reserve then
+		return false, "reserve " .. fmt(reserve)
+	end
+	if neutralFront == 0 then
+		return false, "no neutral front"
+	end
+	local target = pickNeutral(s, owner)
+	if not target then
+		return false, "no neutral site"
+	end
+	local ok = pcall(function()
+		sess:send_intent({ type = "attack", tile = target, ratio = RATIO_NEUTRAL })
+	end)
+	if ok then
+		return true, "expand"
+	end
+	return false, "send failed"
+end
+
+local function attackEnemy(force)
+	local s, owner, sess = live()
+	if not s then
+		return false, "not in match"
+	end
+	local info = s:get_owner(owner)
+	if not info then
+		return false, "no owner"
+	end
+	local reserve = reserveFor(info)
+	local floor = force and reserve or math.max(reserve * 1.5, 15000)
+	if info.troops < floor then
+		return false, "reserve " .. fmt(floor)
+	end
+	if enemyFront == 0 then
+		return false, "no enemy front"
+	end
+	local target, targetOwner, targetTroops = pickEnemy(s, owner, info.troops, force)
+	if not target then
+		return false, "no weak target"
+	end
+	local ratio = clamp((targetTroops or 0) * 1.5 / math.max(info.troops, 1), 0.1, 0.6)
+	if force then
+		ratio = math.max(ratio, 0.35)
+	end
+	local ok = pcall(function()
+		sess:send_intent({ type = "attack", tile = target, ratio = ratio })
+	end)
+	if ok then
+		brain.target = targetOwner or 0
+		return true, "hit " .. tostring(s:owner_name(targetOwner)) .. " " .. tostring(math.floor(ratio * 100)) .. "%"
+	end
+	return false, "send failed"
+end
+
+local function attackOnce(wantEnemy, force)
+	if wantEnemy then
+		return attackEnemy(force)
+	end
+	return attackNeutral(force)
+end
+
+local function boatOnce(wantEnemy, force)
+	local s, owner, sess = live()
+	if not s then
+		return false, "not in match"
+	end
+	local info = s:get_owner(owner)
+	if not info then
+		return false, "no owner"
+	end
+	local reserve = reserveFor(info)
+	if not force and info.troops < math.max(reserve * 1.5, 12000) then
+		return false, "reserve " .. fmt(reserve)
+	end
+	if #coast == 0 then
+		return false, "coast scanning"
+	end
+	boatCursor = (boatCursor % #coast) + 1
+	local anchor = coast[boatCursor]
+	if not anchor or tileOwner(s, anchor) ~= owner then
+		return false, "no own coast"
+	end
+	local W = s.W
+	local ax, ay = anchor % W, anchor // W
+	local map = s.map
+	local nearestNeutral, nnd, nearestEnemy, ned, enemyTroops, bridge, bridgeDist
+	for j = 0, map.land_count - 1 do
+		local t = buffer.readi32(map.land_list, j * 4)
+		if buffer.readu8(map.coastal, t) == 1 then
+			local o = tileOwner(s, t)
+			if o ~= owner and not s:are_allies(owner, o) then
+				local d = math.abs(t % W - ax) + math.abs(t // W - ay)
+				if o == 0 then
+					if not nnd or d < nnd then
+						nearestNeutral, nnd = t, d
+					end
+					local x = t % W
+					local contested = false
+					for _, n in ipairs({ x > 0 and t - 1 or -1, x < W - 1 and t + 1 or -1, t >= W and t - W or -1, t < s.N - W and t + W or -1 }) do
+						if n >= 0 and isLand(s, n) then
+							local no = tileOwner(s, n)
+							if no ~= 0 and no ~= owner and not s:are_allies(owner, no) then
+								contested = true
+								break
+							end
+						end
+					end
+					if contested and (not bridgeDist or d < bridgeDist) then
+						bridge, bridgeDist = t, d
+					end
+				else
+					local ei = s:get_owner(o)
+					if ei and ei.alive and (force or info.troops > ei.troops * 1.5 + 5000) then
+						if not ned or d < ned then
+							nearestEnemy, ned, enemyTroops = t, d, ei.troops
+						end
+					end
+				end
+			end
+		end
+	end
+	local target = wantEnemy and (nearestEnemy or bridge or nearestNeutral) or (bridge or nearestNeutral or nearestEnemy)
+	if not target then
+		return false, "no safe coast target"
+	end
+	local ratio = force and 0.4 or RATIO_BOAT
+	local ok = pcall(function()
+		sess:send_intent({ type = "boat", tile = target, ratio = ratio })
+	end)
+	if ok then
+		return true, "boat " .. tostring(target)
+	end
+	return false, "boat send failed"
+end
+
+local KIND_NAME = {
+	[0] = "city",
+	[1] = "port",
+	[2] = "factory",
+	[3] = "defense",
+	[4] = "sam",
+	[5] = "silo",
+	[6] = "artillery",
+	[7] = "airfield",
+	[8] = "railgun",
+}
+
+local function blitz(count)
+	local sent = 0
+	for _ = 1, count or 8 do
+		local ok
+		if enemyFront > 0 then
+			ok = attackEnemy(true)
+		else
+			ok = boatOnce(true, true)
+		end
+		if ok then
+			sent = sent + 1
+		end
+		task.wait(0.5)
+	end
+	return sent
+end
+
+local function structCounts(s, owner)
+	local counts = { city = 0, port = 0, factory = 0, defense = 0, sam = 0, silo = 0, artillery = 0, airfield = 0, railgun = 0, total = 0 }
+	local occupied = {}
+	for _, str in pairs(s.structures) do
+		if str.owner == owner then
+			local name = KIND_NAME[str.kind]
+			if name then
+				counts[name] = counts[name] + 1
+			end
+			counts.total = counts.total + 1
+			occupied[str.tile] = true
+		end
+	end
+	return counts, occupied
+end
+
+local function phaseFor(s, owner, info, counts)
+	local tiles = info.tiles or 0
+	local income = info.income or 0
+	local cities = counts.city or 0
+	local share = 0
+	pcall(function()
+		share = s:land_share(owner) or 0
+	end)
+	if share >= 0.5 or tiles >= 25000 or (income >= 45000 and cities >= 7) then
+		return "late"
+	end
+	if share >= 0.2 or tiles >= 9000 or income >= 22000 or cities >= 4 then
+		return "mid"
+	end
+	return "early"
+end
+
+local function chooseGoal(s, owner, info, counts)
+	local under = incomingCount(s, owner) > 0 or (brain.threatUntil or 0) > os.clock()
+	if counts.city < 1 then
+		return "city"
+	end
+	if under and counts.defense < 1 then
+		return "defense"
+	end
+	if counts.city < 2 then
+		return "city"
+	end
+	if counts.factory < 2 then
+		return "factory"
+	end
+	if #coast > 0 and counts.port < 1 then
+		return "port"
+	end
+	if under and counts.defense < 2 then
+		return "defense"
+	end
+	if counts.city < 4 then
+		return "city"
+	end
+	if counts.factory < 4 then
+		return "factory"
+	end
+	if counts.silo < 1 and info.gold > 1500000 and (info.income or 0) > 8000 then
+		return "silo"
+	end
+	return counts.city < 6 and "city" or "factory"
+end
+
+local function pickAnchor(goal, occupied)
+	local pool = owned
+	if goal == "defense" or goal == "artillery" or goal == "sam" then
+		pool = #frontier > 0 and frontier or owned
+	elseif goal == "port" then
+		pool = #coast > 0 and coast or owned
+	end
+	if #pool == 0 then
+		return nil
+	end
+	local avoidFront = goal == "city" or goal == "factory" or goal == "silo"
+	for _ = 1, math.min(#pool, 40) do
+		local t = pool[math.random(1, #pool)]
+		if t and not occupied[t] and not (avoidFront and frontierSet[t]) then
+			return t
+		end
+	end
+	for _ = 1, math.min(#pool, 20) do
+		local t = pool[math.random(1, #pool)]
+		if t and not occupied[t] then
+			return t
+		end
+	end
+end
+
+local function buildOnce(forceKind, preferredAnchors)
+	local s, owner, sess = live()
+	if not s then
+		return false, "not in match"
+	end
+	local info = s:get_owner(owner)
+	if not info then
+		return false, "no owner"
+	end
+	local counts, occupied = structCounts(s, owner)
+	local goal = forceKind or chooseGoal(s, owner, info, counts)
+	local okCost, cost = pcall(function()
+		return Rules.cost_of(s, owner, goal)
+	end)
+	if not okCost or type(cost) ~= "number" or cost < 0 then
+		return false, "locked"
+	end
+	if info.gold < cost then
+		return false, "save " .. fmt(cost) .. " " .. goal
+	end
+	local anchors, seen = {}, {}
+	if preferredAnchors and #preferredAnchors > 0 then
+		for i = 1, math.min(#preferredAnchors, 64) do
+			local anchor = preferredAnchors[i]
+			if type(anchor) == "number" and anchor >= 0 and not seen[anchor] then
+				seen[anchor] = true
+				anchors[#anchors + 1] = anchor
+			end
+		end
+	else
+		for _ = 1, 32 do
+			local anchor = pickAnchor(goal, occupied)
+			if not anchor or seen[anchor] then
+				break
+			end
+			seen[anchor] = true
+			anchors[#anchors + 1] = anchor
+		end
+	end
+	local lastReason = "no room"
+	for _, anchor in ipairs(anchors) do
+		local okPlace, place = pcall(function()
+			return Rules.placement(s, owner, goal, anchor)
+		end)
+		if okPlace and type(place) == "table" and place.ok and place.tile then
+			local buildTile = place.tile
+			if type(buildTile) == "number" and buildTile >= 0 then
+				local tooFar = goal == "sam" and tileDistance(s, buildTile, anchor) > SAM_ANCHOR_RADIUS
+				if tooFar then
+					lastReason = "sam too far"
+				else
+					local ok = pcall(function()
+						sess:send_intent({ type = "build", kind = goal, tile = buildTile, amount = 1 })
+					end)
+					if ok then
+						return true, goal .. " " .. fmt(cost)
+					end
+					return false, "send failed"
+				end
+			end
+		elseif okPlace and type(place) == "table" then
+			lastReason = place.reason or lastReason
+			if lastReason == "gold" then
+				return false, "gold"
+			end
+		end
+	end
+	return false, lastReason
+end
+
+local betrayedUntil = {}
+
+local function allyOnce()
+	local s, owner, sess = live()
+	if not s then
+		return 0
+	end
+	local accepted = 0
+	for key in pairs(s.requests) do
+		local from = key // 1024
+		local to = key % 1024
+		if to == owner and from > 0 and not s:are_allies(owner, from)
+			and not ((betrayedUntil[from] or 0) > os.clock()) then
+			local ok = pcall(function()
+				sess:send_intent({ type = "ally_reply", target = from, accept = true })
+			end)
+			if ok then
+				accepted = accepted + 1
+				if accepted >= 3 then
+					break
+				end
+			end
+		end
+	end
+	return accepted
+end
+
+local function nukeOnce()
+	local s, owner, sess = live()
+	if not s then
+		return false, "not in match"
+	end
+	local launcher = false
+	for _, str in pairs(s.structures) do
+		if str.owner == owner and str.kind == 5 then
+			launcher = true
+			break
+		end
+	end
+	if not launcher then
+		local built, res = buildOnce("silo")
+		if built then
+			return false, "silo ordered"
+		end
+		return false, res
+	end
+	local ranking = s:ranking()
+	local targetOwner, targetTile, bestScore
+	for i = 1, #ranking do
+		local own = ranking[i]
+		if own and own.id ~= owner and own.alive and not s:are_allies(owner, own.id) then
+			local value, tile, tileWeight = 0, nil, 0
+			for _, str in pairs(s.structures) do
+				if str.owner == own.id then
+					local weight = 1
+					if str.kind == 0 or str.kind == 1 or str.kind == 2 then
+						weight = 3
+					elseif str.kind == 5 or str.kind == 7 or str.kind == 8 then
+						weight = 2
+					end
+					value = value + weight
+					if weight >= 2 and weight > tileWeight and type(str.tile) == "number" then
+						tile, tileWeight = str.tile, weight
+					end
+				end
+			end
+			local score = value * 100 + (own.troops or 0) * 0.02
+			if value > 0 and (not bestScore or score > bestScore) then
+				bestScore = score
+				targetOwner = own
+				targetTile = tile
+			end
+		end
+	end
+	if not targetOwner then
+		for i = 1, #ranking do
+			local own = ranking[i]
+			if own and own.id ~= owner and own.alive and not s:are_allies(owner, own.id) then
+				if not targetOwner or (own.troops or 0) < (targetOwner.troops or 0) then
+					targetOwner = own
+				end
+			end
+		end
+	end
+	if not targetOwner then
+		return false, "no target"
+	end
+	local tile = targetTile or targetOwner.spawn_tile
+	if type(tile) ~= "number" or tile < 0 or tileOwner(s, tile) ~= targetOwner.id then
+		tile = targetOwner.label_tile
+	end
+	if type(tile) ~= "number" or tile < 0 then
+		return false, "no target tile"
+	end
+	local ok = pcall(function()
+		sess:send_intent({ type = "nuke", kind = "atom", tile = tile, amount = 1 })
+	end)
+	if ok then
+		return true, s:owner_name(targetOwner.id)
+	end
+	return false, "nuke failed"
+end
+
+local autoPlay = false
+local statusText = "ready"
+
+local DOM = {
+	version = "dominate-6",
+	intel = nil,
+	intelAt = 0,
+	candidates = {},
+	lastAlly = 0,
+	lastNuke = 0,
+	lastNukeTry = 0,
+	focusOwner = nil,
+	focusUntil = 0,
+	allies = {},
+	allyInit = false,
+	betrayed = {},
+	counterOwner = nil,
+	bigAttack = false,
+	lastBigLog = 0,
+	lastTiles = nil,
+	lossWindow = 0,
+	lastLossAt = 0,
+	invadedUntil = 0,
+	invader = nil,
+	lastAction = "",
+	log = {},
+	plans = 0,
+}
+
+local DOM_MAX_LOG = 60
+local DOM_INTEL_INTERVAL = 1
+local DOM_ATTACK_INTERVAL = 1.8
+local DOM_BUILD_INTERVAL = 4
+local DOM_ALLY_INTERVAL = 4
+local DOM_NUKE_INTERVAL = 45
+local DOM_GOLD_FLOOR = 20000
+local DOM_MAX_TARGETS = 220
+local DOM_FOCUS_TIME = 24
+
+local function domLog(kind, text)
+	local entry = { t = os.clock(), kind = tostring(kind), text = tostring(text) }
+	DOM.log[#DOM.log + 1] = entry
+	if #DOM.log > DOM_MAX_LOG then
+		table.remove(DOM.log, 1)
+	end
+	DOM.lastAction = entry.kind .. ": " .. entry.text
+end
+
+local function clamp(n, lo, hi)
+	if n < lo then
+		return lo
+	end
+	if n > hi then
+		return hi
+	end
+	return n
+end
+
+local function tileDistance(s, a, b)
+	local W = s.W
+	return math.abs(a % W - b % W) + math.abs(a // W - b // W)
+end
+
+local function structMap(s)
+	local map = {}
+	for _, str in pairs(s.structures) do
+		map[str.tile] = { owner = str.owner, kind = str.kind, active = str.active }
+	end
+	return map
+end
+
+local SAM_CENTER_RADIUS = 8
+local SAM_USEFUL_RADIUS = 16
+local SAM_ANCHOR_RADIUS = 4
+
+local function importantCenters(s, intel)
+	local info = intel and intel.info
+	local list, seen = {}, {}
+	local function add(t)
+		if type(t) == "number" and t >= 0 and not seen[t] then
+			seen[t] = true
+			list[#list + 1] = t
+		end
+	end
+	if not info then
+		return list
+	end
+	add(info.spawn_tile)
+	add(info.label_tile)
+	for t, str in pairs(intel.structs or {}) do
+		if str.owner == info.id and (str.kind == 0 or str.kind == 2) then
+			add(t)
+		end
+	end
+	local scored = {}
+	for _, t in ipairs(list) do
+		local n = 0
+		for _, u in ipairs(list) do
+			if tileDistance(s, t, u) <= SAM_USEFUL_RADIUS then
+				n = n + 1
+			end
+		end
+		scored[#scored + 1] = { tile = t, score = n }
+	end
+	table.sort(scored, function(a, b)
+		return a.score > b.score
+	end)
+	local out = {}
+	for i = 1, math.min(#scored, 24) do
+		out[i] = scored[i].tile
+	end
+	return out
+end
+
+local function importantAnchors(intel, s)
+	local info = intel and intel.info
+	local list, seen = {}, {}
+	if not info or not s then
+		return list
+	end
+	local function add(t)
+		if type(t) == "number" and t >= 0 and not seen[t] then
+			seen[t] = true
+			list[#list + 1] = t
+		end
+	end
+	local centers = importantCenters(s, intel)
+	for _, t in ipairs(centers) do
+		if tileOwner(s, t) == info.id and not intel.structs[t] then
+			add(t)
+		end
+	end
+	local W, H = s.W, s.N // s.W
+	for r = 1, SAM_CENTER_RADIUS do
+		for _, center in ipairs(centers) do
+			local cx, cy = center % W, center // W
+			for dx = -r, r do
+				local dy = r - math.abs(dx)
+				for _, sign in ipairs(dy == 0 and { 1 } or { 1, -1 }) do
+					local x, y = cx + dx, cy + dy * sign
+					if x >= 0 and x < W and y >= 0 and y < H then
+						local t = y * W + x
+						if tileOwner(s, t) == info.id and not intel.structs[t] then
+							add(t)
+						end
+					end
+				end
+			end
+			if #list >= 192 then
+				return list
+			end
+		end
+	end
+	return list
+end
+
+local function usefulSAMCount(s, intel)
+	local info = intel and intel.info
+	if not info then
+		return 0
+	end
+	local centers = importantCenters(s, intel)
+	local count = 0
+	for t, str in pairs(intel.structs or {}) do
+		if str.owner == info.id and str.kind == 4 then
+			for _, c in ipairs(centers) do
+				if tileDistance(s, t, c) <= SAM_USEFUL_RADIUS then
+					count = count + 1
+					break
+				end
+			end
+		end
+	end
+	return count
+end
+
+local function intelOwners(s, intel)
+	local ranking = s:ranking()
+	for i = 1, #ranking do
+		local r = ranking[i]
+		local info = s:get_owner(r.id)
+		intel.ranking[i] = {
+			id = r.id,
+			name = r.name,
+			tiles = r.tiles,
+			info = info,
+		}
+		if info then
+			intel.owners[r.id] = {
+				id = r.id,
+				name = r.name,
+				tiles = info.tiles or r.tiles or 0,
+				troops = info.troops or 0,
+				income = info.income or 0,
+				alive = info.alive,
+			}
+		end
+	end
+end
+
+local function buildIntel(s, owner)
+	local info = s:get_owner(owner)
+	local counts, occupied = structCounts(s, owner)
+	local intel = {
+		at = os.clock(),
+		W = s.W,
+		info = info,
+		owners = {},
+		ranking = {},
+		counts = counts,
+		occupied = occupied,
+		structs = structMap(s),
+		ownedCount = #owned,
+		coastCount = #coast,
+		frontierCount = #frontier,
+		neutralFront = neutralFront,
+		enemyFront = enemyFront,
+		allyFront = allyFront,
+		incoming = { count = 0, troops = 0, sources = {} },
+		threat = false,
+		bigAttack = false,
+		counterOwner = nil,
+		invaded = false,
+		invader = nil,
+		outnumbered = false,
+		strategicOutnumbered = false,
+		hardOutnumbered = false,
+		tacticalOutnumbered = false,
+		enemySpent = false,
+		canCounter = false,
+		canRaid = false,
+		incomingRatio = 0,
+		advantage = 0,
+		enemyLeft = 0,
+		threatOwner = nil,
+		phase = "early",
+		strategy = PHASE.early,
+		defenseCap = PHASE.early.defenseCap,
+		betrayal = false,
+		betrayer = nil,
+		reserve = 0,
+		weakest = nil,
+		strongest = nil,
+	}
+	if not info then
+		return intel
+	end
+	local now = os.clock()
+	intel.reserve = reserveFor(info)
+	intel.threat = (brain.threatUntil or 0) > now
+	intel.phase = phaseFor(s, owner, info, counts)
+	intel.strategy = PHASE[intel.phase] or PHASE.early
+	intel.defenseCap = intel.strategy.defenseCap
+	intelOwners(s, intel)
+	for _, a in pairs(s.attacks) do
+		if a.target == owner and a.attacker ~= 0 then
+			intel.incoming.count = intel.incoming.count + 1
+			intel.incoming.troops = intel.incoming.troops + (a.troops or 0)
+			local src = intel.incoming.sources[a.attacker]
+			if not src then
+				src = { count = 0, troops = 0, name = tostring(s:owner_name(a.attacker)) }
+				intel.incoming.sources[a.attacker] = src
+			end
+			src.count = src.count + 1
+			src.troops = src.troops + (a.troops or 0)
+		end
+	end
+	if intel.incoming.count > 0 then
+		intel.threat = true
+		local top, topScore
+		for id, src in pairs(intel.incoming.sources) do
+			local score = src.troops
+			if (betrayedUntil[id] or 0) > now then
+				score = score * 3 + 1000
+			end
+			if not top or score > topScore then
+				top, topScore = id, score
+			end
+		end
+		intel.counterOwner = top
+		DOM.counterOwner = top
+		if top then
+			DOM.focusOwner = top
+			DOM.focusUntil = now + DOM_FOCUS_TIME * 2
+		end
+		intel.bigAttack = intel.incoming.count >= 4
+			or intel.incoming.troops > math.max((info.troops or 0) * 0.4, 25000)
+		if intel.bigAttack and (not DOM.bigAttack or now - DOM.lastBigLog > 10) then
+			DOM.lastBigLog = now
+			domLog("alert", "big attack " .. fmt(intel.incoming.troops))
+		end
+	end
+	DOM.bigAttack = intel.bigAttack
+	intel.enemyCount = 0
+	for id, e in pairs(intel.owners) do
+		if id ~= owner and e.alive and not s:are_allies(owner, id) then
+			intel.enemyCount = intel.enemyCount + 1
+			if not intel.weakest or e.troops < intel.weakest.troops then
+				intel.weakest = e
+			end
+			if not intel.strongest or e.troops > intel.strongest.troops then
+				intel.strongest = e
+			end
+		end
+	end
+	local currentAllies = {}
+	for id, e in pairs(intel.owners) do
+		if id ~= owner and e.alive and s:are_allies(owner, id) then
+			currentAllies[id] = true
+		end
+	end
+	if DOM.allyInit then
+		for id in pairs(DOM.allies) do
+			local e = intel.owners[id]
+			if e and e.alive and not currentAllies[id] then
+				betrayedUntil[id] = now + 180
+				DOM.focusOwner = id
+				DOM.focusUntil = now + DOM_FOCUS_TIME * 2
+				domLog("betray", tostring(s:owner_name(id)))
+			end
+		end
+	end
+	DOM.allies = currentAllies
+	DOM.allyInit = true
+	for id in pairs(intel.incoming.sources) do
+		if (betrayedUntil[id] or 0) > now or DOM.allies[id] then
+			intel.betrayal = true
+			intel.betrayer = id
+			DOM.focusOwner = id
+			DOM.focusUntil = now + DOM_FOCUS_TIME * 2
+			if (betrayedUntil[id] or 0) <= now then
+				betrayedUntil[id] = now + 180
+				domLog("betray", tostring(s:owner_name(id)) .. " attacks")
+			end
+			break
+		end
+	end
+	if not intel.betrayal then
+		local bestTroops = -1
+		for id, untilAt in pairs(betrayedUntil) do
+			if untilAt > now then
+				local e = intel.owners[id]
+				if e and e.alive and e.troops > bestTroops then
+					bestTroops = e.troops
+					intel.betrayal = true
+					intel.betrayer = id
+				end
+			end
+		end
+		if intel.betrayer then
+			DOM.focusOwner = intel.betrayer
+			DOM.focusUntil = now + DOM_FOCUS_TIME * 2
+		end
+	end
+	local tiles = info.tiles or 0
+	if DOM.lastTiles and DOM.lastTiles > 1000 and tiles < 200 then
+		DOM.lastTiles = tiles
+		DOM.invadedUntil = 0
+		DOM.invader = nil
+	elseif DOM.lastTiles and tiles < DOM.lastTiles then
+		local lost = DOM.lastTiles - tiles
+		DOM.lossWindow = (DOM.lossWindow or 0) + lost
+		DOM.lastLossAt = now
+		local threshold = math.max(4, math.floor((DOM.lastTiles or tiles) * 0.0015))
+		if DOM.lossWindow >= threshold then
+			local totalLost = DOM.lossWindow
+			local wasInvaded = (DOM.invadedUntil or 0) > now
+			DOM.invadedUntil = now + 35
+			DOM.lossWindow = 0
+			local inv = intel.counterOwner or (wasInvaded and DOM.invader or nil)
+			if not inv and intel.strongest then
+				inv = intel.strongest.id
+			end
+			if inv then
+				DOM.invader = inv
+				DOM.focusOwner = inv
+				DOM.focusUntil = now + DOM_FOCUS_TIME * 2
+			end
+			if not wasInvaded then
+				local name = inv and tostring(s:owner_name(inv)) or "unknown"
+				domLog("invaded", name .. " -" .. tostring(totalLost))
+			end
+		end
+	elseif DOM.lastTiles and tiles > DOM.lastTiles then
+		DOM.lossWindow = math.max(0, (DOM.lossWindow or 0) - (tiles - DOM.lastTiles) * 0.5)
+	end
+	if now - (DOM.lastLossAt or 0) > 20 then
+		DOM.lossWindow = 0
+	end
+	DOM.lastTiles = tiles
+	intel.invaded = (DOM.invadedUntil or 0) > now
+	intel.invader = DOM.invader
+	local threatOwner = intel.counterOwner or intel.betrayer or (intel.invaded and intel.invader or nil)
+	local threatInfo = threatOwner and intel.owners[threatOwner] or nil
+	local mainEnemy = threatInfo or intel.strongest
+	local myTroops = info.troops or 0
+	local incoming = intel.incoming.troops or 0
+	intel.threatOwner = threatOwner
+	intel.enemyLeft = mainEnemy and (mainEnemy.troops or 0) or 0
+	intel.incomingRatio = incoming / math.max(myTroops, 1)
+	intel.advantage = myTroops / math.max(intel.enemyLeft, incoming, 1)
+	intel.enemySpent = incoming > 0 and mainEnemy ~= nil
+		and intel.enemyLeft <= math.max(intel.reserve, myTroops * 0.25)
+	if intel.enemySpent then
+		for id in pairs(intel.incoming.sources) do
+			local e = intel.owners[id]
+			if e and (e.troops or 0) > math.max(intel.reserve, myTroops * 0.25) then
+				intel.enemySpent = false
+				break
+			end
+		end
+	end
+	intel.strategicOutnumbered = intel.strongest ~= nil
+		and (intel.strongest.troops or 0) > myTroops * 1.3
+	intel.hardOutnumbered = intel.strongest ~= nil
+		and (intel.strongest.troops or 0) > myTroops * 1.8
+	intel.tacticalOutnumbered = incoming > myTroops * 0.55
+		or (intel.incoming.count >= 4 and incoming > myTroops * 0.35)
+	intel.outnumbered = (intel.incoming.count > 0 or intel.invaded)
+		and not intel.enemySpent
+		and (intel.tacticalOutnumbered or (mainEnemy ~= nil and intel.enemyLeft > myTroops * 1.25))
+	intel.canCounter = intel.incoming.count > 0
+		and myTroops > intel.reserve * 1.05
+		and (intel.enemySpent or intel.advantage >= 0.9)
+	intel.canRaid = myTroops > intel.reserve * intel.strategy.raidReserve
+		and (not intel.tacticalOutnumbered or intel.enemySpent)
+	return intel
+end
+
+local function collectCandidates(s, owner, intel)
+	local list = {}
+	local seen = {}
+	local myTroops = (intel.info and intel.info.troops) or 0
+	for i = 1, #frontier do
+		local src = frontier[i]
+		if src and tileOwner(s, src) == owner then
+			for _, target in ipairs(nearbyTargets(s, src, owner)) do
+				if not seen[target.tile] then
+					seen[target.tile] = true
+					local o = target.owner
+					local e = o ~= 0 and intel.owners[o] or nil
+					if o == 0 or (e and e.alive) then
+						local c = {
+							tile = target.tile,
+							owner = o,
+							enemy = e,
+							size = clusterScore(s, target.tile, owner),
+							dist = tileDistance(s, target.tile, intel.info.spawn_tile or target.tile),
+							coastal = type(s.map.coastal) == "buffer" and buffer.readu8(s.map.coastal, target.tile) == 1,
+							defended = false,
+							value = 0,
+							score = 0,
+						}
+						local str = intel.structs[target.tile]
+						if str and str.owner == o then
+							if str.kind == 3 or str.kind == 4 or str.kind == 6 then
+								c.defended = true
+							end
+							if str.kind == 0 or str.kind == 1 or str.kind == 2 then
+								c.value = 60
+							elseif str.kind == 5 or str.kind == 7 or str.kind == 8 then
+								c.value = 40
+							elseif str.kind == 3 or str.kind == 4 or str.kind == 6 then
+								c.value = -40
+							end
+						end
+						if o == 0 then
+							c.score = 100 + c.size * 12 + (c.coastal and 8 or 0) - c.dist / 24
+						elseif e then
+							local advantage = myTroops / math.max(e.troops, 1)
+							c.score = 60 + clamp(advantage, 0, 6) * 16 + c.size * 9 + (e.tiles or 0) * 0.02 - c.dist / 30 + c.value
+							if c.defended then
+								c.score = c.score - 120
+							end
+						end
+						list[#list + 1] = c
+						if #list >= DOM_MAX_TARGETS then
+							return list
+						end
+					end
+				end
+			end
+		end
+	end
+	return list
+end
+
+local function bestNeutralTarget(intel)
+	local best
+	for _, c in ipairs(DOM.candidates) do
+		if c.owner == 0 and (not best or c.score > best.score) then
+			best = c
+		end
+	end
+	return best
+end
+
+local function bestEnemyTarget(intel, myTroops, now)
+	local cfg = intel.strategy or PHASE.early
+	local focus = DOM.focusOwner
+	local focusLive = focus and (DOM.focusUntil or 0) > now
+	local focusEnemy = focusLive and intel.owners[focus] or nil
+	local focusAttackable = focusEnemy and focusEnemy.alive
+		and (myTroops > (focusEnemy.troops or 0) * (intel.enemySpent and 1.05 or cfg.enemyNeed) + 3000
+			or (intel.weakest and (focusEnemy.troops or 0) <= (intel.weakest.troops or 0) * 1.2))
+	local best, bestScore
+	local focusBest, focusScore
+	for _, c in ipairs(DOM.candidates) do
+		if c.owner ~= 0 and c.enemy and c.enemy.alive then
+			local advantage = myTroops / math.max(c.enemy.troops, 1)
+			local caution = (intel.enemyCount or 0) > 1 and (intel.phase == "late" and 0.15 or 0.35) or 0
+			local need = (c.defended and cfg.enemyNeed + 0.7 or cfg.enemyNeed) + caution
+			if intel.outnumbered and not intel.enemySpent then
+				need = need + 0.35
+			end
+			if advantage >= need or myTroops > c.enemy.troops * need + 5000 then
+				local score = c.score - (c.defended and 90 or 0)
+				if (betrayedUntil[c.owner] or 0) > now then
+					score = score + 220
+				end
+				if intel.enemySpent and c.owner == intel.threatOwner then
+					score = score + 260
+				end
+				if intel.weakest and c.owner == intel.weakest.id then
+					score = score + 60
+				end
+				if intel.hardOutnumbered and intel.weakest and c.owner ~= intel.weakest.id then
+					score = score - 120
+				end
+				if not best or score > bestScore then
+					best, bestScore = c, score
+				end
+				if focusAttackable and c.owner == focus and (not focusBest or score > focusScore) then
+					focusBest, focusScore = c, score
+				end
+			end
+		end
+	end
+	return focusBest or best
+end
+
+local function attackRatioFor(c, myTroops, intel)
+	local cfg = intel and intel.strategy or PHASE.early
+	if c.owner == 0 then
+		return clamp(cfg.neutral + c.size * 0.008, cfg.neutralMin, cfg.neutralMax)
+	end
+	local need = c.defended and cfg.enemyNeed + 0.6 or cfg.enemyNeed
+	local needed = (c.enemy and c.enemy.troops or 0) * need + 4000
+	local low = cfg.enemyMin
+	local high = cfg.enemyMax
+	if intel and intel.enemySpent then
+		low = math.min(low, 0.2)
+		high = 0.85
+	end
+	if intel and intel.phase == "late" then
+		high = 0.85
+	end
+	return clamp(needed / math.max(myTroops, 1), low, high)
+end
+
+local function sendDomAttack(s, owner, sess, intel, mode, now)
+	local info = intel.info
+	if not info then
+		return false, "no owner"
+	end
+	local target
+	if mode == "EXPAND" then
+		target = bestNeutralTarget(intel) or bestEnemyTarget(intel, info.troops, now)
+	elseif mode == "ATTACK" or mode == "DEFEND" then
+		target = bestEnemyTarget(intel, info.troops, now) or bestNeutralTarget(intel)
+	else
+		target = bestNeutralTarget(intel) or bestEnemyTarget(intel, info.troops, now)
+	end
+	if not target then
+		return false, "no target"
+	end
+	if target.owner ~= 0 and target.enemy then
+		local cap = intel.enemySpent and 1.25 or (intel.phase == "late" and 1.1 or 0.95)
+		if target.enemy.troops > info.troops * cap then
+			return false, "stronger " .. tostring(target.enemy.name)
+		end
+	end
+	local reserveFloor = math.max(2500, intel.reserve * (intel.tacticalOutnumbered and 1.5 or 1.0))
+	if intel.enemySpent and target.enemy then
+		reserveFloor = math.min(reserveFloor, math.max(1500, info.troops * 0.15))
+	end
+	if info.troops < reserveFloor then
+		return false, "reserve " .. fmt(reserveFloor)
+	end
+	if target.owner ~= 0 and info.troops < reserveFloor * 1.1 then
+		return false, "attack reserve"
+	end
+	local ratio = attackRatioFor(target, info.troops, intel)
+	local ok = pcall(function()
+		sess:send_intent({ type = "attack", tile = target.tile, ratio = ratio })
+	end)
+	if not ok then
+		return false, "send failed"
+	end
+	brain.lastAttack = now
+	brain.target = target.owner
+	brain.goal = mode
+	brain.score = target.score
+	brain.attackNote = ""
+	if target.owner ~= 0 then
+		DOM.focusOwner = target.owner
+		DOM.focusUntil = now + DOM_FOCUS_TIME
+	end
+	local name = target.owner == 0 and "neutral" or tostring(s:owner_name(target.owner))
+	return true, string.format("%s %s %d%%", mode:lower(), name, math.floor(ratio * 100))
+end
+
+local function threatAnchors(s, intel)
+	local targetOwner = intel.counterOwner or intel.betrayer or (intel.invaded and intel.invader or nil)
+	if not targetOwner then
+		return nil
+	end
+	local targetInfo = s:get_owner(targetOwner)
+	local anchor = targetInfo and (targetInfo.label_tile or targetInfo.spawn_tile)
+	if not anchor then
+		return nil
+	end
+	local info = intel.info
+	local W, N = s.W, s.N
+	local list = {}
+	for i = 1, #frontier do
+		local t = frontier[i]
+		local pressure = 0
+		local x = t % W
+		for _, n in ipairs({ x > 0 and t - 1 or -1, x < W - 1 and t + 1 or -1, t >= W and t - W or -1, t < N - W and t + W or -1 }) do
+			if n >= 0 and isLand(s, n) then
+				local o = tileOwner(s, n)
+				if o ~= 0 and o ~= info.id and not s:are_allies(info.id, o) then
+					pressure = pressure + 1
+				end
+			end
+		end
+		list[#list + 1] = { tile = t, dist = tileDistance(s, t, anchor), pressure = pressure }
+	end
+	table.sort(list, function(a, b)
+		if a.pressure ~= b.pressure then
+			return a.pressure > b.pressure
+		end
+		return a.dist < b.dist
+	end)
+	local out = {}
+	for i = 1, math.min(#list, 32) do
+		out[i] = list[i].tile
+	end
+	return out
+end
+
+local function planBuild(s, intel, now)
+	local info = intel.info
+	if not info then
+		return nil, "no owner"
+	end
+	local counts = intel.counts
+	local tiles = info.tiles or intel.ownedCount or 0
+	local income = info.income or 0
+	local phase = intel.phase or "early"
+	local cfg = intel.strategy or PHASE.early
+	local threat = intel.threat or intel.incoming.count > 0 or intel.invaded or intel.betrayal
+	local attacked = intel.incoming.count > 0 or intel.bigAttack or intel.invaded or intel.betrayal
+	local economyGood = income >= 12000
+		and counts.city >= 4
+		and counts.factory >= 2
+	local economyPlusPlus = income >= 30000
+		and counts.city >= 6
+		and counts.factory >= 3
+	local crisis = intel.tacticalOutnumbered or intel.bigAttack
+	local defenseNeed = 0
+	if counts.city >= 1 and (intel.enemyFront > 0 or threat) then
+		defenseNeed = 1
+		if intel.enemyFront > 0 then
+			defenseNeed = math.max(defenseNeed, 1 + math.floor(intel.enemyFront / 180))
+		end
+		if crisis then
+			defenseNeed = math.max(defenseNeed, phase == "early" and 1 or 2)
+		end
+		if intel.bigAttack and (intel.incoming.troops or 0) > (info.troops or 0) * 0.55 then
+			defenseNeed = math.max(defenseNeed, phase == "late" and 4 or 3)
+		end
+	end
+	if intel.enemySpent then
+		defenseNeed = math.min(defenseNeed, 1)
+	end
+	defenseNeed = math.min(defenseNeed, cfg.defenseCap or 3)
+	local cityNeed = clamp((phase == "early" and 2 or 3) + math.floor(tiles / 3500), 2, 8)
+	local factoryNeed = clamp(2 + math.floor(tiles / 5000), 2, 6)
+	local portNeed = 0
+	if counts.city >= 1 and intel.coastCount > 0 then
+		portNeed = clamp(1 + math.floor(tiles / 5000), 1, phase == "late" and 5 or 3)
+	end
+	local samUseful = usefulSAMCount(s, intel)
+	local samNeed = phase == "late" and 2 or 0
+	if phase == "mid" and economyGood then
+		samNeed = 1
+	end
+	if economyPlusPlus and samNeed < 1 then
+		samNeed = 1
+	end
+	local desired = {
+		defense = defenseNeed,
+		city = cityNeed,
+		factory = factoryNeed,
+		port = portNeed,
+		silo = 0,
+	}
+	if phase ~= "early" and economyGood and income >= 20000 and info.gold >= 2000000 then
+		desired.silo = 1
+	end
+	local function costOf(goal)
+		local ok, cost = pcall(function()
+			return Rules.cost_of(s, info.id, goal)
+		end)
+		if ok and type(cost) == "number" and cost >= 0 then
+			return cost
+		end
+		return nil
+	end
+	if counts.city >= 1 and samNeed > samUseful and (not crisis or counts.defense >= 1) then
+		local cost = costOf("sam")
+		if cost and info.gold >= cost * 2 then
+			return "sam", cost
+		end
+	end
+	local order = {}
+	local function add(goal, count)
+		if counts[goal] < (count or desired[goal] or 0) then
+			order[#order + 1] = goal
+		end
+	end
+	add("city", 1)
+	if crisis and counts.city >= 1 and counts.defense < 1 then
+		add("defense", 1)
+	end
+	add("factory", 1)
+	if portNeed > 0 then
+		add("port", 1)
+	end
+	if not crisis and counts.defense < math.min(2, defenseNeed) and (attacked or intel.enemyFront > 0) then
+		add("defense", math.min(2, defenseNeed))
+	end
+	add("city", math.min(3, cityNeed))
+	add("factory", math.min(3, factoryNeed))
+	add("defense", defenseNeed)
+	add("city", cityNeed)
+	add("factory", factoryNeed)
+	if portNeed > 1 then
+		add("port", portNeed)
+	end
+	add("silo", desired.silo)
+	local firstGoal, firstCost
+	for _, goal in ipairs(order) do
+		if counts[goal] < (desired[goal] or 0) then
+			local cost = costOf(goal)
+			if cost then
+				if not firstGoal then
+					firstGoal, firstCost = goal, cost
+				end
+				local buffer = (goal == "city" or goal == "factory" or goal == "port") and 5000 or DOM_GOLD_FLOOR
+				if info.gold >= cost + buffer then
+					return goal, cost
+				end
+			end
+		end
+	end
+	if firstGoal then
+		return nil, "save " .. fmt(firstCost) .. " " .. firstGoal
+	end
+	return nil, "maxed"
+end
+
+local function economyAnchors(intel)
+	local info = intel.info
+	if not info then
+		return nil
+	end
+	local out = {}
+	for t, str in pairs(intel.structs or {}) do
+		if str.owner == info.id and (str.kind == 0 or str.kind == 1 or str.kind == 2) then
+			out[#out + 1] = t
+		end
+	end
+	if #out == 0 then
+		return nil
+	end
+	return out
+end
+
+local function portAnchors(intel)
+	local info = intel.info
+	if not info or #coast == 0 then
+		return nil
+	end
+	local econ = {}
+	for t, str in pairs(intel.structs or {}) do
+		if str.owner == info.id and (str.kind == 0 or str.kind == 1 or str.kind == 2) then
+			econ[#econ + 1] = t
+		end
+	end
+	if #econ == 0 then
+		return nil
+	end
+	local W = intel.W or 1600
+	local list = {}
+	for i = 1, #coast do
+		local t = coast[i]
+		local x, y = t % W, t // W
+		local best = 1e9
+		for j = 1, #econ do
+			local e = econ[j]
+			local d = math.abs(e % W - x) + math.abs(e // W - y)
+			if d < best then
+				best = d
+			end
+		end
+		list[#list + 1] = { tile = t, d = best }
+	end
+	table.sort(list, function(a, b)
+		return a.d < b.d
+	end)
+	local out = {}
+	for i = 1, math.min(#list, 32) do
+		out[i] = list[i].tile
+	end
+	return out
+end
+
+local function buildDom(s, intel, now)
+	local goal, cost = planBuild(s, intel, now)
+	if not goal then
+		return false, tostring(cost)
+	end
+	local preferred
+	if goal == "sam" then
+		preferred = importantAnchors(intel, s)
+	elseif goal == "defense" then
+		local threat = (intel.invaded or intel.betrayal or intel.bigAttack or intel.incoming.count > 0)
+		local list = {}
+		local seen = {}
+		local function push(src)
+			for _, a in ipairs(src or {}) do
+				if type(a) == "number" and not seen[a] then
+					seen[a] = true
+					list[#list + 1] = a
+				end
+			end
+		end
+		if threat then
+			push(threatAnchors(s, intel))
+		end
+		push(importantAnchors(intel, s))
+		preferred = list
+	elseif goal == "city" or goal == "factory" then
+		preferred = economyAnchors(intel)
+	elseif goal == "port" then
+		preferred = portAnchors(intel)
+	end
+	local ok, detail = buildOnce(goal, preferred)
+	if not ok and preferred and (goal == "defense" or goal == "city" or goal == "factory") then
+		ok, detail = buildOnce(goal)
+	end
+	if ok then
+		return true, tostring(detail)
+	end
+	return false, tostring(goal) .. ": " .. tostring(detail)
+end
+
+local function hasEnemyNeighbor(s, t, owner)
+	local W, N = s.W, s.N
+	local x = t % W
+	for _, n in ipairs({ x > 0 and t - 1 or -1, x < W - 1 and t + 1 or -1, t >= W and t - W or -1, t < N - W and t + W or -1 }) do
+		if n >= 0 and isLand(s, n) then
+			local o = tileOwner(s, n)
+			if o ~= 0 and o ~= owner and not s:are_allies(owner, o) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function findBeachhead(s, owner, intel)
+	local best, bestScore
+	local map = s.map
+	local W = s.W
+	local anchor = coast[boatCursor] or coast[1]
+	if not anchor then
+		return nil
+	end
+	local now = os.clock()
+	local ax, ay = anchor % W, anchor // W
+	for j = 0, map.land_count - 1 do
+		local t = buffer.readi32(map.land_list, j * 4)
+		if buffer.readu8(map.coastal, t) == 1 then
+			local o = tileOwner(s, t)
+			if o ~= owner and not s:are_allies(owner, o) and not ((boatBlocked[t] or 0) > now) then
+				local e = o ~= 0 and intel.owners[o] or nil
+				local valid = o == 0 or (e and e.alive and intel.info.troops > e.troops * 1.5 + 8000)
+				if valid then
+					local d = math.abs(t % W - ax) + math.abs(t // W - ay)
+					local size = clusterScore(s, t, owner)
+					local score = 80 - d / 28 + size * 7
+					if o == 0 then
+						score = score + 30
+					end
+					if hasEnemyNeighbor(s, t, owner) then
+						score = score + 36
+					end
+					local str = intel.structs[t]
+					if str and str.owner == o and (str.kind == 3 or str.kind == 4 or str.kind == 6) then
+						score = score - 90
+					end
+					if not best or score > bestScore then
+						best = { tile = t, owner = o, enemy = e, dist = d, size = size, score = score }
+						bestScore = score
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function sailDom(s, owner, sess, intel, now)
+	local info = intel.info
+	if not info then
+		return false, "no owner"
+	end
+	if info.troops < math.max(intel.reserve * 1.5, 14000) then
+		return false, "boat reserve " .. fmt(intel.reserve)
+	end
+	if #coast > 0 then
+		boatCursor = (boatCursor % #coast) + 1
+	end
+	local target = findBeachhead(s, owner, intel)
+	if not target then
+		return false, "no beachhead"
+	end
+	local ratio = 0.34
+	if target.owner ~= 0 and target.enemy then
+		local needed = target.enemy.troops * 1.35 + 4000
+		ratio = clamp(needed / math.max(info.troops, 1), 0.34, 0.65)
+	end
+	local ok = pcall(function()
+		sess:send_intent({ type = "boat", tile = target.tile, ratio = ratio })
+	end)
+	if not ok then
+		return false, "boat send failed"
+	end
+	lastBoat = now
+	boatBlocked[target.tile] = now + 25
+	brain.target = target.owner
+	brain.goal = "BOAT"
+	brain.score = target.score
+	return true, "boat " .. tostring(target.tile) .. " " .. tostring(math.floor(ratio * 100)) .. "%"
+end
+
+local function sendCounterAttack(s, owner, sess, intel, now)
+	local targetOwner = intel.counterOwner or intel.betrayer
+	if not targetOwner then
+		return false, "no attacker"
+	end
+	local info = intel.info
+	if not info then
+		return false, "no owner"
+	end
+	if intel.tacticalOutnumbered and not intel.enemySpent and info.troops < intel.reserve * 1.4 then
+		return false, "hold defense"
+	end
+	if intel.bigAttack and not intel.enemySpent and (intel.incoming.troops or 0) > info.troops * 0.65 then
+		return false, "hold big"
+	end
+	if info.troops < intel.reserve * 1.15 then
+		return false, "counter reserve"
+	end
+	local targetInfo = intel.owners[targetOwner]
+	local cap = intel.enemySpent and 1.4 or (intel.phase == "late" and 1.1 or 0.9)
+	if targetInfo and (targetInfo.troops or 0) > info.troops * cap then
+		return false, "counter stronger"
+	end
+	local best
+	for _, c in ipairs(DOM.candidates) do
+		if c.owner == targetOwner and c.enemy then
+			if not best or c.score > best.score then
+				best = c
+			end
+		end
+	end
+	if not best then
+		return false, "no counter target"
+	end
+	local cfg = intel.strategy or PHASE.early
+	local ratio = clamp(attackRatioFor(best, info.troops, intel) * 0.9, cfg.enemyMin, cfg.enemyMax)
+	local ok = pcall(function()
+		sess:send_intent({ type = "attack", tile = best.tile, ratio = ratio })
+	end)
+	if not ok then
+		return false, "counter send failed"
+	end
+	brain.lastAttack = now
+	brain.target = targetOwner
+	brain.goal = "COUNTER"
+	brain.score = best.score
+	brain.attackNote = ""
+	DOM.focusOwner = targetOwner
+	DOM.focusUntil = now + DOM_FOCUS_TIME * 2
+	return true, string.format("counter %s %d%%", tostring(s:owner_name(targetOwner)), math.floor(ratio * 100))
+end
+
+local function autoNuke(s, owner, sess, intel, now)
+	if intel.phase ~= "late" or (intel.counts.silo or 0) < 1 then
+		return false, "no silo"
+	end
+	if (intel.info.gold or 0) < 1500000 then
+		return false, "nuke gold"
+	end
+	if now - (DOM.lastNuke or 0) < DOM_NUKE_INTERVAL then
+		return false, "nuke cooldown"
+	end
+	if now - (DOM.lastNukeTry or 0) < 5 then
+		return false, "nuke wait"
+	end
+	DOM.lastNukeTry = now
+	if intel.bigAttack and not intel.enemySpent then
+		return false, "nuke held"
+	end
+	local threat = intel.strongest
+	if not threat or (threat.troops or 0) < (intel.info.troops or 0) * 0.7 then
+		return false, "no hard target"
+	end
+	local ok, detail = nukeOnce()
+	if ok then
+		DOM.lastNuke = now
+		domLog("nuke", detail)
+		return true, "nuke " .. tostring(detail)
+	end
+	return false, detail
+end
+
+local function chooseMode(intel)
+	local info = intel.info
+	if not info then
+		return "HOLD", "no owner"
+	end
+	if intel.betrayal then
+		local name = intel.betrayer and intel.owners[intel.betrayer]
+		local label = tostring(name and name.name or intel.betrayer)
+		if intel.enemySpent or (intel.canRaid and intel.advantage >= 1.0) then
+			return "ATTACK", "PUNISH betrayer " .. label
+		end
+		return "DEFEND", "BETRAYAL " .. label
+	end
+	if intel.invaded then
+		local name = intel.invader and intel.owners[intel.invader]
+		local label = tostring(name and name.name or intel.invader or "unknown")
+		if intel.enemySpent then
+			return "ATTACK", "PUNISH " .. label .. " spent"
+		end
+		if (intel.canCounter or intel.canRaid) and intel.advantage >= 1.0 then
+			return "ATTACK", "COUNTER " .. label
+		end
+		local tag = intel.outnumbered and "INVADED outnumbered " or "INVADED "
+		return "DEFEND", tag .. label
+	end
+	if intel.threat or intel.incoming.count > 0 then
+		if intel.enemySpent then
+			return "ATTACK", "PUNISH " .. fmt(intel.incoming.troops) .. " spent"
+		end
+		if intel.bigAttack then
+			return "DEFEND", "BIG attack " .. fmt(intel.incoming.troops)
+		end
+		if intel.incoming.count > 0 then
+			if intel.canRaid and (intel.incoming.troops or 0) < info.troops * 0.3 then
+				return "ATTACK", "COUNTER weak"
+			end
+			return "DEFEND", tostring(intel.incoming.count) .. " incoming"
+		end
+		if intel.threat then
+			return "DEFEND", "landed threat"
+		end
+	end
+	if info.troops < intel.reserve then
+		return "HOLD", "reserve " .. fmt(intel.reserve)
+	end
+	if intel.neutralFront > 0 and (intel.phase == "early" or intel.enemyFront == 0 or info.troops < intel.reserve * 2.5) then
+		return "EXPAND", "take land"
+	end
+	if intel.enemyFront > 0 then
+		local f = DOM.focusOwner
+		if intel.outnumbered and not intel.enemySpent then
+			local weak = intel.weakest
+			if weak and (weak.troops or 0) < info.troops * 0.8 then
+				return "ATTACK", "raid " .. tostring(weak.name)
+			end
+			if intel.phase == "late" and intel.canRaid then
+				return "ATTACK", "break " .. tostring(intel.strongest and intel.strongest.name or "front")
+			end
+			return "DEFEND", "hold vs " .. tostring(intel.strongest and intel.strongest.name or "stronger")
+		end
+		if f and (DOM.focusUntil or 0) > os.clock() and intel.owners[f] then
+			return "ATTACK", "press " .. tostring(intel.owners[f].name)
+		end
+		return "ATTACK", "hunt weak"
+	end
+	if intel.neutralFront > 0 then
+		return "EXPAND", "take land"
+	end
+	if intel.coastCount > 0 then
+		return "BOAT", "find beachhead"
+	end
+	return "HOLD", "idle"
+end
+
+local function domTick(now)
+	local s, owner, sess = live()
+	if not s then
+		brain.mode, brain.note = "HOLD", "no match"
+		return nil
+	end
+	if now - DOM.intelAt >= DOM_INTEL_INTERVAL or not DOM.intel then
+		DOM.intel = buildIntel(s, owner)
+		DOM.intelAt = now
+		if DOM.intel.info then
+			DOM.candidates = collectCandidates(s, owner, DOM.intel)
+		end
+	end
+	local intel = DOM.intel
+	if not intel or not intel.info then
+		brain.mode, brain.note = "HOLD", "no intel"
+		return nil
+	end
+	local mode, note = chooseMode(intel)
+	brain.mode, brain.note = mode, note
+	brain.reserve = intel.reserve
+	brain.phase = intel.phase
+	brain.outnumbered = intel.outnumbered
+	brain.enemySpent = intel.enemySpent
+	local status
+	if now - brain.lastBuild >= DOM_BUILD_INTERVAL then
+		brain.lastBuild = now
+		local ok, detail = buildDom(s, intel, now)
+		if ok then
+			status = "built " .. detail
+			domLog("build", detail)
+		else
+			status = "plan: " .. detail
+			brain.buildNote = detail
+		end
+	end
+	if (mode == "DEFEND" or intel.enemySpent) and (intel.counterOwner or intel.betrayer)
+		and now - brain.lastAttack >= 3 then
+		local ok, detail = sendCounterAttack(s, owner, sess, intel, now)
+		if ok then
+			status = detail
+			domLog("counter", detail)
+		else
+			brain.attackNote = detail
+		end
+	end
+	if mode == "DEFEND" and intel.canRaid
+		and now - brain.lastAttack >= DOM_ATTACK_INTERVAL
+		and intel.info.troops > intel.reserve * 1.15 then
+		local ok, detail = sendDomAttack(s, owner, sess, intel, "ATTACK", now)
+		if ok then
+			status = "raid " .. detail
+			domLog("raid", detail)
+		else
+			brain.attackNote = detail
+		end
+	end
+	local mayAttack = mode == "EXPAND" or mode == "ATTACK"
+	if (intel.invaded or intel.betrayal) and not intel.enemySpent and not intel.canRaid then
+		mayAttack = false
+	elseif mode == "DEFEND" and (intel.incoming.count == 0 or intel.enemySpent)
+		and intel.info.troops > intel.reserve * 1.3 then
+		mayAttack = true
+	end
+	if intel.tacticalOutnumbered and not intel.enemySpent
+		and intel.info.troops < intel.reserve * 1.4 then
+		mayAttack = false
+	end
+	if mayAttack and now - brain.lastAttack >= DOM_ATTACK_INTERVAL then
+		local ok, detail = sendDomAttack(s, owner, sess, intel, mode, now)
+		if ok then
+			status = detail
+			domLog("attack", detail)
+		else
+			brain.attackNote = detail
+		end
+	end
+	if intel.phase == "late" and (mode ~= "DEFEND" or intel.enemySpent) then
+		local ok, detail = autoNuke(s, owner, sess, intel, now)
+		if ok then
+			status = detail
+		end
+	end
+	local noLandTarget = #frontier == 0 or brain.attackNote == "no target"
+	local hedgeBoat = mode == "DEFEND" and intel.outnumbered and not intel.bigAttack
+		and intel.coastCount > 0 and intel.neutralFront == 0
+		and intel.info.troops > intel.reserve * 1.4
+	local wantBoat = mode == "BOAT" or (noLandTarget and intel.coastCount > 0 and not intel.bigAttack) or hedgeBoat
+	if wantBoat and now - lastBoat >= BOAT_INTERVAL then
+		local ok, detail = sailDom(s, owner, sess, intel, now)
+		if ok then
+			status = detail
+			domLog("boat", detail)
+		else
+			brain.boatNote = detail
+		end
+	end
+	return status
+end
+
+local oldGui = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("RF_MP_OP")
+if oldGui then
+	oldGui:Destroy()
+end
+local oldSolo = LP:FindFirstChild("PlayerGui") and LP.PlayerGui:FindFirstChild("RF_OP")
+if oldSolo then
+	oldSolo:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "RF_MP_OP"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999999
+gui.Parent = LP:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Name = "Main"
+frame.Size = UDim2.fromOffset(282, 320)
+frame.Position = UDim2.new(1, -298, 0, 70)
+frame.BackgroundColor3 = Color3.fromRGB(13, 16, 20)
+frame.BackgroundTransparency = 0.06
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = gui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = frame
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(64, 190, 140)
+stroke.Transparency = 0.35
+stroke.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 34)
+title.BackgroundColor3 = Color3.fromRGB(20, 26, 24)
+title.BackgroundTransparency = 0.05
+title.BorderSizePixel = 0
+title.Text = "  ROFRONT MP // SABLE"
+title.TextColor3 = Color3.fromRGB(120, 235, 180)
+title.Font = Enum.Font.Code
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = frame
+
+local tcorner = Instance.new("UICorner")
+tcorner.CornerRadius = UDim.new(0, 8)
+tcorner.Parent = title
+
+local min = Instance.new("TextButton")
+min.Size = UDim2.fromOffset(36, 34)
+min.Position = UDim2.new(1, -38, 0, 0)
+min.BackgroundTransparency = 1
+min.Text = "_"
+min.TextColor3 = Color3.fromRGB(160, 170, 165)
+min.Font = Enum.Font.Code
+min.TextSize = 18
+min.Parent = frame
+
+local stats = Instance.new("TextLabel")
+stats.Size = UDim2.new(1, -16, 0, 64)
+stats.Position = UDim2.new(0, 8, 0, 38)
+stats.BackgroundTransparency = 1
+stats.Text = ""
+stats.TextColor3 = Color3.fromRGB(150, 190, 175)
+stats.Font = Enum.Font.Code
+stats.TextSize = 11
+stats.TextXAlignment = Enum.TextXAlignment.Left
+stats.TextYAlignment = Enum.TextYAlignment.Top
+stats.TextWrapped = true
+stats.Parent = frame
+
+local function setStatus(text)
+	statusText = tostring(text)
+end
+
+local function makeToggle(text, y)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -16, 0, 36)
+	b.Position = UDim2.new(0, 8, 0, y)
+	b.BackgroundColor3 = Color3.fromRGB(26, 31, 34)
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = true
+	b.Text = text .. "  [OFF]"
+	b.TextColor3 = Color3.fromRGB(205, 214, 210)
+	b.Font = Enum.Font.Code
+	b.TextSize = 13
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.Name = text
+	b.Parent = frame
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 6)
+	c.Parent = b
+	return b
+end
+
+local function makeButton(text, y, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -16, 0, 34)
+	b.Position = UDim2.new(0, 8, 0, y)
+	b.BackgroundColor3 = color or Color3.fromRGB(28, 40, 38)
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = true
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(210, 225, 218)
+	b.Font = Enum.Font.Code
+	b.TextSize = 13
+	b.Name = text
+	b.Parent = frame
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 6)
+	c.Parent = b
+	return b
+end
+
+local function paintToggle(b, on)
+	if on then
+		b.BackgroundColor3 = Color3.fromRGB(24, 78, 58)
+		b.TextColor3 = Color3.fromRGB(150, 255, 200)
+	else
+		b.BackgroundColor3 = Color3.fromRGB(26, 31, 34)
+		b.TextColor3 = Color3.fromRGB(205, 214, 210)
+	end
+	local label = string.match(b.Text, "^(.-)%s+%[")
+	b.Text = (label or b.Name) .. (on and "  [ON]" or "  [OFF]")
+end
+
+local playBtn = makeToggle("AUTO DOMINATE", 108)
+playBtn.Size = UDim2.new(1, -16, 0, 40)
+playBtn.TextSize = 15
+playBtn.BackgroundColor3 = Color3.fromRGB(30, 24, 30)
+
+local function setPlay(on)
+	autoPlay = on
+	paintToggle(playBtn, on)
+	setStatus(on and "auto dominate ON" or "auto dominate OFF")
+end
+
+playBtn.MouseButton1Click:Connect(function()
+	setPlay(not autoPlay)
+end)
+
+local blitzBtn = makeButton("BLITZ FRONT", 158, Color3.fromRGB(58, 22, 30))
+blitzBtn.MouseButton1Click:Connect(function()
+	task.spawn(function()
+		local sent = blitz(10)
+		setStatus("blitz sent " .. tostring(sent))
+	end)
+end)
+
+local nukeBtn = makeButton("NUKE INFRA", 196, Color3.fromRGB(60, 34, 24))
+nukeBtn.MouseButton1Click:Connect(function()
+	local ok, fired, detail = pcall(nukeOnce)
+	if not ok then
+		setStatus("nuke err")
+	elseif fired then
+		setStatus("nuke on " .. tostring(detail))
+	else
+		setStatus("nuke: " .. tostring(detail))
+	end
+end)
+
+local buildNow = makeButton("BUILD ONE", 234, Color3.fromRGB(24, 34, 44))
+buildNow.MouseButton1Click:Connect(function()
+	local ok, built, detail = pcall(buildOnce)
+	if not ok then
+		setStatus("build err")
+	elseif built then
+		setStatus("built " .. tostring(detail))
+	else
+		setStatus("build: " .. tostring(detail))
+	end
+end)
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -16, 0, 36)
+status.Position = UDim2.new(0, 8, 1, -40)
+status.BackgroundTransparency = 1
+status.Text = "ready"
+status.TextColor3 = Color3.fromRGB(150, 165, 158)
+status.Font = Enum.Font.Code
+status.TextSize = 11
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.Parent = frame
+
+local hide = false
+min.MouseButton1Click:Connect(function()
+	hide = not hide
+	for _, c in ipairs(frame:GetChildren()) do
+		if c ~= title and c ~= min then
+			c.Visible = not hide
+		end
+	end
+	frame.Size = UDim2.fromOffset(282, hide and 34 or 320)
+end)
+
+local dragging, dragStart, startPos
+title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = frame.Position
+	end
+end)
+title.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = false
+	end
+end)
+UIS.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+	end
+end)
+UIS.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		frame.Visible = not frame.Visible
+	end
+end)
+
+local msgState, msgConn
+local function hookMessages()
+	local s, owner = live()
+	if not s or msgState == s then
+		return
+	end
+	if msgConn then
+		pcall(function()
+			msgConn:Disconnect()
+		end)
+	end
+	msgState = s
+	lastMsg = ""
+	local sig = s.message
+	if sig and sig.Connect then
+		msgConn = sig:Connect(function(o, _, text)
+			local t = tostring(text or "")
+			local useful = t:find("^Your") or t:find("^You ") or t:find("Not enough") or t:find("No room")
+				or t:find("Can't build") or t:find("your coast") or t:find("your land")
+				or t:find("Only ") or t:find("already at")
+			if t:find("toward your coast") or t:find("on your coast") or t:find("landed troops") then
+				brain.threatUntil = os.clock() + 45
+			end
+			if o == owner and useful then
+				lastMsg = t
+			end
+		end)
+	end
+end
+
+local lastStats = 0
+local loopErr = ""
+local function updateStats()
+	local s, owner = live()
+	if not s then
+		stats.Text = "waiting for match..."
+		status.Text = statusText
+		return
+	end
+	local info = s:get_owner(owner)
+	if not info then
+		return
+	end
+	local ranking = s:ranking()
+	local lines = {
+		string.format("TROOPS %s   GOLD %s", fmt(info.troops), fmt(info.gold)),
+		string.format("TILES %d   SHARE %.1f%%   FRONT %d/%d", info.tiles, (s:land_share(owner) or 0) * 100, neutralFront, enemyFront),
+		string.format("MODE %s  %s  %s", brain.mode, brain.note, brain.phase or "early"),
+	}
+	for i = 1, math.min(1, #ranking) do
+		local own = ranking[i]
+		if own then
+			lines[#lines + 1] = string.format("%d %s  %s", i, tostring(own.name):sub(1, 14), fmt(own.tiles))
+		end
+	end
+	if lastMsg ~= "" then
+		lines[#lines + 1] = "srv: " .. lastMsg:sub(1, 46)
+	end
+	if loopErr ~= "" then
+		lines[#lines + 1] = "ERR " .. loopErr:sub(1, 44)
+	end
+	stats.Text = table.concat(lines, "\n")
+	status.Text = statusText
+end
+
+local domFails = 0
+local function fallbackTick(now)
+	local s, owner = live()
+	if not s then
+		return nil
+	end
+	local info = s:get_owner(owner)
+	if not info then
+		return nil
+	end
+	local reserve = reserveFor(info)
+	brain.reserve = reserve
+	local under = incomingCount(s, owner)
+	local mode
+	if info.troops < reserve then
+		mode = "HOLD"
+	elseif under > 0 or (brain.threatUntil or 0) > now then
+		mode = "DEFEND"
+	elseif neutralFront > 0 then
+		mode = "EXPAND"
+	elseif enemyFront > 0 then
+		mode = "ATTACK"
+	elseif #coast > 0 then
+		mode = "BOAT"
+	else
+		mode = "HOLD"
+	end
+	brain.mode, brain.note = mode, "fallback"
+	if now - brain.lastAttack >= 1.2 then
+		if mode == "EXPAND" then
+			local ok, detail = attackNeutral()
+			if ok then
+				brain.lastAttack = now
+				return "fallback expand " .. tostring(detail)
+			end
+		elseif mode == "ATTACK" or mode == "DEFEND" then
+			local ok, detail = attackEnemy()
+			if ok then
+				brain.lastAttack = now
+				return "fallback attack " .. tostring(detail)
+			end
+		end
+	end
+	if mode == "BOAT" and now - lastBoat >= BOAT_INTERVAL then
+		local ok, detail = boatOnce(false)
+		if ok then
+			lastBoat = now
+			return "fallback boat " .. tostring(detail)
+		end
+	end
+	if now - brain.lastBuild >= 4 then
+		brain.lastBuild = now
+		local ok, detail = buildOnce()
+		if ok then
+			return "fallback build " .. tostring(detail)
+		end
+	end
+	return nil
+end
+
+local tick = 0
+task.spawn(function()
+	while gui.Parent do
+		tick = tick + 1
+		local ok, err = xpcall(function()
+			loopErr = ""
+			hookMessages()
+			pcall(scanStep, SCAN_BUDGET)
+			if autoPlay then
+				local dok, status = pcall(domTick, os.clock())
+				if dok then
+					domFails = 0
+					if status then
+						setStatus(status)
+					end
+				else
+					domFails = domFails + 1
+					loopErr = "dom " .. tostring(status)
+					if domFails >= 5 then
+						local fok, fstatus = pcall(fallbackTick, os.clock())
+						if fok and fstatus then
+							setStatus(fstatus)
+						end
+					end
+				end
+			else
+				brain.mode, brain.note = "HOLD", "auto off"
+			end
+			if tick % 10 == 0 then
+				pcall(updateStats)
+			end
+		end, function(e)
+			return tostring(e) .. " @ " .. tostring(debug.traceback("", 2))
+		end)
+		if ok then
+			task.wait(0.1)
+		else
+			loopErr = tostring(err)
+			pcall(updateStats)
+			task.wait(1)
+		end
+	end
+end)
+
+updateStats()
+_G.RF_MP = {
+	findSession = findSession,
+	live = live,
+	brain = function()
+		return brain
+	end,
+	debug = function()
+		local s, owner = live()
+		if not s then
+			return nil
+		end
+		local units, attacks = 0, 0
+		for _, u in pairs(s.units) do
+			if u.owner == owner and u.kind == 0 and (u.troops or 0) > 0 then
+				units = units + 1
+			end
+		end
+		for _, a in pairs(s.attacks) do
+			if a.attacker == owner then
+				attacks = attacks + 1
+			end
+		end
+		local intel = DOM.intel
+		return {
+			owner = owner,
+			owned = #owned,
+			coast = #coast,
+			frontier = #frontier,
+			neutral = neutralFront,
+			enemy = enemyFront,
+			ally = allyFront,
+			units = units,
+			attacks = attacks,
+			phase = intel and intel.phase or "early",
+			outnumbered = intel and intel.outnumbered or false,
+			strategicOutnumbered = intel and intel.strategicOutnumbered or false,
+			tacticalOutnumbered = intel and intel.tacticalOutnumbered or false,
+			enemySpent = intel and intel.enemySpent or false,
+			canCounter = intel and intel.canCounter or false,
+			canRaid = intel and intel.canRaid or false,
+			incomingTroops = intel and intel.incoming.troops or 0,
+			enemyLeft = intel and intel.enemyLeft or 0,
+			advantage = intel and intel.advantage or 0,
+			defenseCap = intel and intel.defenseCap or 0,
+		}
+	end,
+	scan = scanStep,
+	attack = attackOnce,
+	boat = boatOnce,
+	blitz = blitz,
+	build = buildOnce,
+	buildProbe = function()
+		local s, owner = live()
+		if not s then
+			return nil
+		end
+		local intel = buildIntel(s, owner)
+		local goal, detail = planBuild(s, intel, os.clock())
+		local okCost, cost = pcall(function()
+			return Rules.cost_of(s, owner, "sam")
+		end)
+		return {
+			goal = goal,
+			detail = detail,
+			gold = intel.info and intel.info.gold,
+			income = intel.info and intel.info.income,
+			samUseful = usefulSAMCount(s, intel),
+			samCount = intel.counts.sam,
+			samCost = okCost and cost or nil,
+			counts = intel.counts,
+		}
+	end,
+	balance = function()
+		local s, owner = live()
+		if not s then
+			return nil
+		end
+		local intel = buildIntel(s, owner)
+		if not intel.info then
+			return nil
+		end
+		return {
+			phase = intel.phase,
+			troops = intel.info.troops,
+			income = intel.info.income,
+			gold = intel.info.gold,
+			incoming = intel.incoming,
+			strongest = intel.strongest,
+			weakest = intel.weakest,
+			outnumbered = intel.outnumbered,
+			strategicOutnumbered = intel.strategicOutnumbered,
+			tacticalOutnumbered = intel.tacticalOutnumbered,
+			enemySpent = intel.enemySpent,
+			canCounter = intel.canCounter,
+			canRaid = intel.canRaid,
+			advantage = intel.advantage,
+			defenseCap = intel.defenseCap,
+			counts = intel.counts,
+			mode = brain.mode,
+			note = brain.note,
+		}
+	end,
+	ally = allyOnce,
+	nuke = nukeOnce,
+	auto = setPlay,
+	setAuto = function(name, on)
+		if type(name) == "boolean" then
+			setPlay(name)
+		else
+			setPlay(on == true)
+		end
+	end,
+	getAuto = function()
+		return autoPlay
+	end,
+	plan = function()
+		return DOM.intel, DOM.candidates, DOM.log
+	end,
+	log = function()
+		return DOM.log
+	end,
+	version = DOM.version,
+	status = setStatus,
+}
