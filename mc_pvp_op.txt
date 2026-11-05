@@ -1,58 +1,219 @@
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LP = Players.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
 
 if _G.MC_PVP_ATTR_GEN then
 	_G.MC_PVP_ATTR_GEN = _G.MC_PVP_ATTR_GEN + 1
+end
+if _G.MC_PVP_GEN then
+	_G.MC_PVP_GEN = _G.MC_PVP_GEN + 1
+end
+if _G.MC_PVP_CUSTOM_GEN then
+	_G.MC_PVP_CUSTOM_GEN = _G.MC_PVP_CUSTOM_GEN + 1
 else
-	_G.MC_PVP_ATTR_GEN = 1
+	_G.MC_PVP_CUSTOM_GEN = 1
 end
-local GEN = _G.MC_PVP_ATTR_GEN
-local old = PG:FindFirstChild("MC_PVP_ATTR")
-if old then
-	old:Destroy()
+local GEN = _G.MC_PVP_CUSTOM_GEN
+
+local oldAttr = PG:FindFirstChild("MC_PVP_ATTR")
+if oldAttr then
+	oldAttr:Destroy()
+end
+local oldCustom = PG:FindFirstChild("MC_PVP_OP")
+if oldCustom then
+	oldCustom:Destroy()
+end
+for _, instance in ipairs(workspace:GetDescendants()) do
+	if instance.Name == "SABLE_ESP_HL" or instance.Name == "SABLE_ESP_INFO" then
+		instance:Destroy()
+	end
 end
 
-local function readBool(name, default)
-	local value = LP:GetAttribute(name)
-	if type(value) == "boolean" then
-		return value
-	end
-	return default
-end
-
-local function readNumber(name, default)
-	local value = LP:GetAttribute(name)
-	if type(value) == "number" then
-		return value
-	end
-	return default
-end
+local Controller = ReplicatedStorage:WaitForChild("Client"):WaitForChild("Controller")
+local ER = require(Controller:WaitForChild("EntityRenderer"))
+local CC = require(Controller:WaitForChild("CombatController"))
+local MC = require(Controller:WaitForChild("MovementController"))
+local AT = require(Controller:WaitForChild("AimTargeting"))
+local VC = require(Controller:WaitForChild("ViewmodelController"))
 
 local CFG = {
 	killaura = true,
 	aimbot = true,
 	esp = true,
-	reach = math.clamp(readNumber("cheatReach", 6), 3, 6),
+	reach = 6,
 }
 _G.MC_PVP_CFG = CFG
 
-local function setAttr(name, value)
-	pcall(function()
-		LP:SetAttribute(name, value)
-	end)
+local function active()
+	return _G.MC_PVP_CUSTOM_GEN == GEN
 end
 
 local function apply()
-	setAttr("cheatKillaura", CFG.killaura)
-	setAttr("cheatAimbot", CFG.aimbot)
-	setAttr("cheatEsp", CFG.esp)
-	setAttr("cheatReach", CFG.reach)
+	pcall(function()
+		CC.setReach(CFG.reach)
+	end)
 end
 
-local function active()
-	return _G.MC_PVP_ATTR_GEN == GEN
+local espCache = {}
+_G.MC_PVP_ESP = espCache
+
+local function clearEsp(player)
+	local entry = espCache[player]
+	if not entry then
+		return
+	end
+	if entry.highlight then
+		entry.highlight:Destroy()
+	end
+	if entry.billboard then
+		entry.billboard:Destroy()
+	end
+	espCache[player] = nil
+end
+
+local function clearAllEsp()
+	for player in pairs(espCache) do
+		clearEsp(player)
+	end
+end
+
+local function espColor(entity)
+	local player = entity.player
+	if player and LP.Team and player.Team and player.Team == LP.Team then
+		return Color3.fromRGB(70, 255, 120)
+	end
+	return Color3.fromRGB(255, 70, 70)
+end
+
+local function updateEsp(entity)
+	local player = entity.player
+	if not player or player == LP then
+		return
+	end
+	if entity.health <= 0 or entity.isVanished or entity.isHidden then
+		clearEsp(player)
+		return
+	end
+	local model = entity.hiddenModel or entity.model
+	local adornee = entity.model or model
+	if not model or not adornee then
+		clearEsp(player)
+		return
+	end
+	local entry = espCache[player]
+	if not entry or entry.model ~= model or entry.adornee ~= adornee then
+		clearEsp(player)
+		local color = espColor(entity)
+		local highlight = Instance.new("Highlight")
+		highlight.Name = "SABLE_ESP_HL"
+		highlight.Adornee = model
+		highlight.FillColor = color
+		highlight.OutlineColor = color
+		highlight.FillTransparency = 0.75
+		highlight.OutlineTransparency = 0
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.Parent = model
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "SABLE_ESP_INFO"
+		billboard.Adornee = adornee
+		billboard.AlwaysOnTop = true
+		billboard.MaxDistance = 1000
+		billboard.Size = UDim2.fromOffset(180, 32)
+		billboard.StudsOffset = Vector3.new(0, 3, 0)
+		billboard.LightInfluence = 0
+		billboard.Parent = adornee
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 13
+		label.TextColor3 = color
+		label.TextStrokeTransparency = 0.4
+		label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+		label.Text = player.Name
+		label.Parent = billboard
+		entry = {
+			model = model,
+			adornee = adornee,
+			highlight = highlight,
+			billboard = billboard,
+			label = label,
+		}
+		espCache[player] = entry
+	end
+	local distance = math.floor((entity.position - MC.getPosition()).Magnitude)
+	entry.label.Text = string.format("%s  %d  %dm", player.Name, math.max(0, math.floor(entity.health)), distance)
+	entry.highlight.FillColor = espColor(entity)
+	entry.highlight.OutlineColor = espColor(entity)
+	entry.label.TextColor3 = espColor(entity)
+end
+
+local function espStep()
+	if not CFG.esp then
+		clearAllEsp()
+		return
+	end
+	local seen = {}
+	for _, entity in ipairs(ER.getEntityViewList()) do
+		local player = entity.player
+		if player and player ~= LP then
+			seen[player] = true
+			updateEsp(entity)
+		end
+	end
+	for player in pairs(espCache) do
+		if not seen[player] then
+			clearEsp(player)
+		end
+	end
+end
+
+local nextAttack = 0
+local function attackStep(now)
+	if not CFG.killaura then
+		return
+	end
+	if now < nextAttack then
+		return
+	end
+	nextAttack = now + 1 / 15
+	local eye = MC.getEyePosition()
+	local targets = {}
+	for _, entity in ipairs(ER.getEntityViewList()) do
+		if entity.player ~= LP and CC.canFight(entity) then
+			local point = CC.getClosestHitboxPoint(entity, eye)
+			if (point - eye).Magnitude <= CFG.reach then
+				table.insert(targets, { entity = entity, point = point })
+			end
+		end
+	end
+	if #targets == 0 then
+		return
+	end
+	VC.swing()
+	for _, target in ipairs(targets) do
+		CC.hitEntity(target.entity, target.point)
+	end
+end
+
+local function nearestTarget()
+	local eye = MC.getEyePosition()
+	local best = nil
+	local bestDistance = nil
+	for _, entity in ipairs(ER.getEntityViewList()) do
+		if entity.player ~= LP and CC.canFight(entity) then
+			local point = CC.getClosestHitboxPoint(entity, eye)
+			local distance = (point - eye).Magnitude
+			if distance <= CFG.reach and (not bestDistance or distance < bestDistance) then
+				best = entity
+				bestDistance = distance
+			end
+		end
+	end
+	return best
 end
 
 local gui = Instance.new("ScreenGui")
@@ -84,6 +245,7 @@ stroke.Thickness = 1
 stroke.Parent = frame
 
 local title = Instance.new("TextLabel")
+title.Name = "Title"
 title.Size = UDim2.new(1, -70, 0, 36)
 title.Position = UDim2.new(0, 14, 0, 0)
 title.BackgroundTransparency = 1
@@ -229,7 +391,7 @@ plusBtn.Text = "+"
 plusBtn.Parent = reachRow
 
 local function setReach(value)
-	CFG.reach = math.clamp(value, 3, 6)
+	CFG.reach = math.clamp(value, 3, 12)
 	reachValue.Text = string.format("%.1f", CFG.reach)
 	apply()
 	refresh()
@@ -297,6 +459,34 @@ LP.CharacterAdded:Connect(function()
 	task.wait(0.5)
 	if active() then
 		apply()
+	end
+end)
+
+local lastEsp = 0
+local lastUi = 0
+RunService.Heartbeat:Connect(function()
+	if not active() then
+		return
+	end
+	local now = os.clock()
+	attackStep(now)
+	if now - lastEsp >= 0.2 then
+		lastEsp = now
+		espStep()
+	end
+	if now - lastUi >= 0.2 then
+		lastUi = now
+		refresh()
+	end
+end)
+
+RunService.RenderStepped:Connect(function(dt)
+	if not active() or not CFG.aimbot then
+		return
+	end
+	local target = nearestTarget()
+	if target then
+		AT.easeLookTowards(target, 15, math.min(dt, 0.1))
 	end
 end)
 
