@@ -24,6 +24,7 @@ local CFG = {
 	esp = true,
 	critOnly = true,
 	pearlButton = false,
+	pearlLock = false,
 	range = 3.5,
 	totemHealth = 8,
 	camSmooth = 8,
@@ -80,7 +81,7 @@ pearlStroke.Parent = pearlButton
 
 local frame = Instance.new("Frame")
 frame.Name = "Main"
-frame.Size = UDim2.fromOffset(252, 428)
+frame.Size = UDim2.fromOffset(252, 460)
 frame.Position = UDim2.new(0, 20, 0, 120)
 frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 frame.BackgroundTransparency = 0.05
@@ -132,7 +133,7 @@ close.Parent = frame
 local status = Instance.new("TextLabel")
 status.Name = "Status"
 status.Size = UDim2.new(1, -24, 0, 30)
-status.Position = UDim2.fromOffset(12, 364)
+status.Position = UDim2.fromOffset(12, 396)
 status.BackgroundTransparency = 1
 status.Text = "HP ?   Offhand ?   Targets 0"
 status.Font = Enum.Font.Code
@@ -146,7 +147,7 @@ status.Parent = frame
 local footer = Instance.new("TextLabel")
 footer.Name = "Footer"
 footer.Size = UDim2.new(1, -24, 0, 14)
-footer.Position = UDim2.fromOffset(12, 400)
+footer.Position = UDim2.fromOffset(12, 432)
 footer.BackgroundTransparency = 1
 footer.Text = "K kill T totem P esp C crit G pearl RShift"
 footer.Font = Enum.Font.Code
@@ -164,7 +165,8 @@ local toggleLabels = {
 	camLock = "Camera Lock",
 	esp = "ESP",
 	critOnly = "Crit Only",
-	pearlButton = "Pearl Button"
+	pearlButton = "Pearl Button",
+	pearlLock = "Lock Pearl"
 }
 
 local function makeToggle(labelText, key, y)
@@ -277,10 +279,11 @@ makeToggle("Camera Lock", "camLock", 104)
 makeToggle("ESP", "esp", 136)
 makeToggle("Crit Only", "critOnly", 168)
 makeToggle("Pearl Button", "pearlButton", 200)
-makeStep("Killaura Range", "range", 1, 6, 0.5, 232, "%.1f")
-makeStep("Totem HP", "totemHealth", 1, 20, 1, 264, "%d")
-makeStep("Camera Smooth", "camSmooth", 1, 20, 1, 296, "%d")
-makeStep("Pearl Delay", "pearlDelay", 0.05, 1, 0.05, 328, "%.2f")
+makeToggle("Lock Pearl", "pearlLock", 232)
+makeStep("Killaura Range", "range", 1, 6, 0.5, 264, "%.1f")
+makeStep("Totem HP", "totemHealth", 1, 20, 1, 296, "%d")
+makeStep("Camera Smooth", "camSmooth", 1, 20, 1, 328, "%d")
+makeStep("Pearl Delay", "pearlDelay", 0.05, 1, 0.05, 360, "%.2f")
 
 refresh = function()
 	for key, button in pairs(toggleButtons) do
@@ -293,6 +296,9 @@ refresh = function()
 		item.label.Text = item.format:format(CFG[key])
 	end
 	pearlGui.Enabled = CFG.pearlButton == true
+	local locked = CFG.pearlLock == true
+	pearlButton.Text = locked and "PEARL\nLOCKED" or "PEARL"
+	pearlStroke.Color = locked and Color3.fromRGB(255, 200, 80) or Color3.fromRGB(120, 220, 150)
 end
 
 refresh()
@@ -855,6 +861,7 @@ end
 
 local pearlDragging = false
 local pearlMoved = false
+local pearlDragInput = nil
 local pearlDragStart = nil
 local pearlStartPosition = nil
 
@@ -862,19 +869,23 @@ track(pearlButton.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		pearlDragging = true
 		pearlMoved = false
+		pearlDragInput = input
 		pearlDragStart = input.Position
 		pearlStartPosition = UDim2.fromOffset(pearlButton.AbsolutePosition.X, pearlButton.AbsolutePosition.Y)
 	end
 end))
 
 track(UIS.InputChanged:Connect(function(input)
-	if not pearlDragging then
+	if not pearlDragging or input ~= pearlDragInput then
 		return
 	end
 	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
 		local delta = input.Position - pearlDragStart
 		if delta.Magnitude > 6 then
 			pearlMoved = true
+		end
+		if CFG.pearlLock then
+			return
 		end
 		local camera = workspace.CurrentCamera
 		local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
@@ -888,7 +899,10 @@ end))
 
 track(UIS.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		if pearlDragging and not pearlMoved then
+		if not pearlDragging or input ~= pearlDragInput then
+			return
+		end
+		if not pearlMoved then
 			if pearlCatch() then
 				pearlButton.BackgroundColor3 = Color3.fromRGB(70, 150, 96)
 				task.delay(0.15, function()
@@ -899,6 +913,7 @@ track(UIS.InputEnded:Connect(function(input)
 			end
 		end
 		pearlDragging = false
+		pearlDragInput = nil
 	end
 end))
 
